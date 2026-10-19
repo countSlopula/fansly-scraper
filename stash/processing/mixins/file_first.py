@@ -35,7 +35,7 @@ from helpers.rich_progress import get_progress_manager
 from metadata import Account, Media, Message, Post
 from metadata.models import get_store
 from pathio import get_stash_path
-from textio import print_error, print_info
+from textio import print_error, print_info, print_warning
 
 from ...logging import debug_print
 from ...logging import processing_logger as logger
@@ -303,6 +303,18 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
         posts = await self._gather_creator_posts(account)
         messages = await self._gather_creator_messages(account)
         index = await self._build_media_index([*posts, *messages])
+        if not index:
+            # An empty index makes the whole pass a silent no-op: nothing to
+            # adjudicate, no galleries, no titles — indistinguishable from a
+            # clean run in the log. Say so, and name the usual cause (a
+            # metadata DB that has the media rows but not the post→media
+            # attachments linking them, which only a download run can write).
+            print_warning(
+                f"No downloaded media could be linked to posts or messages for "
+                f"{account.username}: nothing to process. If this creator was "
+                f"downloaded before, run a normal download once to repopulate "
+                f"the post/message attachments this pass reads."
+            )
         # item.id -> (item, [Scene|Image, ...])
         item_entities: dict[int, tuple[Post | Message, list[Scene | Image]]] = {}
         # Media that got a stash_id this run (owned scene / stamped image).

@@ -619,3 +619,22 @@ async def test_persist_item_stash_ids_writes_gallery_ids(
         await pool.fetchval("SELECT stash_id FROM posts WHERE id = $1", ungalleried.id)
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_empty_media_index_warns_instead_of_silent_noop(
+    entity_store, respx_stash_processor, mock_account, caplog
+):
+    """A creator whose media cannot be linked to posts must not pass silently.
+
+    This is the STASH_ONLY failure shape: media rows exist and are downloaded,
+    but nothing joins them to a post, so the pass finds nothing to adjudicate
+    and finishes in seconds looking like a clean success.
+    """
+    processor = respx_stash_processor
+    await entity_store.save(mock_account)
+
+    await processor._prepare_file_first(mock_account)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("nothing to process" in m for m in warnings)
