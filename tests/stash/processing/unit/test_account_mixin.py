@@ -14,6 +14,10 @@ from PIL import Image
 from stash_graphql_client.types import Image as SGCImage
 
 from metadata import PostMention
+from stash.processing.mixins.account import (
+    normalize_mention_handle,
+    performer_identity,
+)
 from tests.fixtures.metadata.metadata_factories import AccountFactory, MediaFactory
 from tests.fixtures.stash.stash_api_fixtures import dump_graphql_calls
 from tests.fixtures.stash.stash_graphql_fixtures import (
@@ -902,3 +906,144 @@ class TestAccountProcessingMixin:
             # Exactly one GraphQL call (performerUpdate). The findImages was
             # served from cache via store.filter().
             assert graphql_route.call_count == 1
+
+
+class TestMentionHandleNormalization:
+    """Coverage for the guard on Fansly's mention-parser artifacts.
+
+    Fansly emits an ``accountMentions`` entry for every ``@`` in a post's text,
+    so a post reading ``"Going live @ 9PM EST"`` produces a mention with
+    an empty handle. Before this guard, such a mention reached
+    ``_get_or_create_performer``, whose alias step searched
+    ``aliases__contains=""`` — which Stash reads as ``LIKE '%%'`` — and attached
+    whichever performer sorted first in the entire library to the scene.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            # Fansly's bare-@ artifacts: nothing usable survives.
+            pytest.param("", None, id="empty"),
+            pytest.param("   ", None, id="whitespace"),
+            pytest.param("10:30pm", None, id="time_from_at10_30pm"),
+            pytest.param("11:57am", None, id="time_with_am"),
+            pytest.param("_@", None, id="punctuation_only_too_short"),
+            pytest.param("abc", None, id="below_min_length"),
+            pytest.param("a" * 31, None, id="above_max_length"),
+            pytest.param("creatorname\xa0and", None, id="interior_nbsp"),
+            pytest.param("creator(x)", None, id="interior_parens"),
+            # Real handles Fansly returned with edge punctuation attached.
+            pytest.param("example,", "example", id="trailing_comma"),
+            pytest.param("sample\u2728", "sample", id="trailing_emoji"),
+            pytest.param("tildecreator~", "tildecreator", id="trailing_tilde"),
+            pytest.param("/demo", "demo", id="leading_slash_from_url"),
+            pytest.param("/some_creator_", "some_creator_", id="slash_keeps_underscore"),
+            pytest.param("bangcreator!", "bangcreator", id="trailing_bang"),
+            # Fansly sometimes substitutes the author's styled display name for
+            # the handle; NFKC folds those alphabets back to ASCII.
+            pytest.param(
+                "\U0001d5d5\U0001d5fc\U0001d5f9\U0001d5f1"
+                "\U0001d5e1\U0001d5ee\U0001d5fa\U0001d5f2",
+                "BoldName",
+                id="mathematical_bold_display_name",
+            ),
+            pytest.param(
+                "\U0001d470\U0001d495\U0001d482\U0001d48d_\U0001d475\U0001d482\U0001d48e\U0001d486",
+                "Ital_Name",
+                id="mathematical_italic_bold_with_underscore",
+            ),
+            # Clean handles pass through untouched.
+            pytest.param("plaincreator", "plaincreator", id="clean"),
+            pytest.param("under_score_name", "under_score_name", id="underscores"),
+            pytest.param(
+                "user123456789012345678",
+                "user123456789012345678",
+                id="auto_generated_22_chars",
+            ),
+        ],
+    )
+    def test_normalize_mention_handle(self, raw, expected):
+        assert normalize_mention_handle(raw) == expected
+
+    def test_performer_identity_rejects_blank_mention(self):
+        """A bare-@ mention yields no identity, so callers skip it entirely."""
+        mention = PostMention(id=snowflake_id(), postId=snowflake_id(), handle="")
+        assert performer_identity(mention) is None
+
+    def test_performer_identity_normalizes_mention_handle(self):
+        """The punctuation Fansly kept is stripped before any lookup."""
+        mention = PostMention(
+            id=snowflake_id(), postId=snowflake_id(), handle="example,"
+        )
+        assert performer_identity(mention) == ("example", "example")
+
+    def test_performer_identity_prefers_account_display_name(self):
+        """Accounts are unaffected: display name searches, username identifies."""
+        account = AccountFactory.build(
+            id=snowflake_id(), username="example", displayName="Example"
+        )
+        assert performer_identity(account) == ("Example", "example")
+
+
+class TestBlankMentionHandleIsNotLookedUp:
+    """The blank handle must never reach Stash as a search."""
+
+    @pytest.mark.asyncio
+    async def test_blank_mention_returns_none_without_any_graphql(
+        self, respx_stash_processor
+    ):
+        """``_get_or_create_performer`` short-circuits on a bare-@ mention.
+
+        Zero GraphQL calls is the assertion that matters: the old code issued a
+        name search, then an ``aliases__contains=""`` search that matched every
+        aliased performer in the library and returned the first one, which was
+        then stamped onto the scene.
+        """
+        mention = PostMention(id=snowflake_id(), postId=snowflake_id(), handle="")
+        await respx_stash_processor.context.get_client()
+
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=AssertionError("blank handle must not reach Stash")
+        )
+
+        try:
+            result = await respx_stash_processor._get_or_create_performer(mention)
+        finally:
+            dump_graphql_calls(graphql_route.calls, "test_blank_mention_no_graphql")
+
+        assert result is None
+        assert graphql_route.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_punctuated_mention_searches_the_stripped_handle(
+        self, respx_stash_processor
+    ):
+        """``"example,"`` resolves the real performer instead of minting a dupe."""
+        mention = PostMention(
+            id=snowflake_id(), postId=snowflake_id(), handle="example,"
+        )
+        await respx_stash_processor.context.get_client()
+
+        performer_dict = create_performer_dict(id="1378", name="Example")
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=[
+                httpx.Response(
+                    200,
+                    json=create_graphql_response(
+                        "findPerformers",
+                        {"count": 1, "performers": [performer_dict]},
+                    ),
+                ),
+            ]
+        )
+
+        try:
+            result = await respx_stash_processor._get_or_create_performer(mention)
+        finally:
+            dump_graphql_calls(graphql_route.calls, "test_punctuated_mention")
+
+        assert result is not None
+        assert result.id == "1378"
+        sent = graphql_route.calls[0].request.content.decode()
+        assert "example" in sent
+        assert "example," not in sent

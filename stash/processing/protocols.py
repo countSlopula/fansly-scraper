@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         Media,
         Message,
         Post,
+        PostMention,
     )
 
 
@@ -127,7 +128,9 @@ class StashProcessingProtocol(Protocol):
 
     async def _find_existing_performer(self, account: Account) -> Performer | None: ...
 
-    async def _get_or_create_performer(self, account: Account) -> Performer: ...
+    async def _get_or_create_performer(
+        self, account: Account | PostMention
+    ) -> Performer | None: ...
 
     async def _update_account_stash_id(
         self,
@@ -340,3 +343,4 @@ class StashProcessingProtocol(Protocol):
         media_with_id: list[Media],
         split_pairs: list[tuple[Media, Scene]],
     ) -> None: ...
+

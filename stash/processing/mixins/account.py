@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import traceback
+import unicodedata
 from typing import TYPE_CHECKING
 
 from stash_graphql_client.types import Image, Performer, UnsetType, is_set
 
+from config.schema import (
+    FANSLY_USERNAME_ALLOWED_CHARS,
+    FANSLY_USERNAME_MAX_LEN,
+    FANSLY_USERNAME_MIN_LEN,
+)
 from metadata import Account, PostMention
 from metadata.models import get_store
 from textio import print_error, print_warning
@@ -18,6 +24,58 @@ from ..protocols import StashProcessingProtocol
 
 if TYPE_CHECKING:
     from metadata.entity_store import PostgresEntityStore
+
+
+def normalize_mention_handle(handle: str | None) -> str | None:
+    """Return *handle* as a usable Fansly username, or ``None`` if it is junk.
+
+    Fansly's mention extractor is naive: it emits an ``accountMentions`` entry
+    for every ``@`` in a post's text regardless of what follows. A bare ``@``
+    before a space — ``"Going live @ 9PM EST"``, ``"See you @ the show"``
+    — yields a mention whose handle is the empty string; ``"@10:30PM EST"``
+    yields ``"10:30pm"``; a real handle the author followed with punctuation or
+    an emoji arrives as ``"example,"`` or ``"sample✨"``; a pasted profile URL
+    arrives as ``"/demo"``. Fansly also substitutes the author's styled
+    display name for the handle, so a creator shows up as ``"\U0001d5d5\U0001d5fc..."``
+    (mathematical-bold ``BoldName``).
+
+    NFKC-fold first, which maps those styled alphabets back to ASCII, then trim
+    the characters a Fansly username cannot contain from both ends, then
+    keep the result only if what remains is a syntactically valid username. That
+    recovers the real handle from the punctuation cases and rejects the rest, so
+    a parser artifact never reaches Stash — neither as a blank-valued search
+    (which matches the entire library) nor as a performer named after a clock
+    time.
+    """
+    if not handle:
+        return None
+    handle = unicodedata.normalize("NFKC", handle)
+    start, end = 0, len(handle)
+    while start < end and handle[start] not in FANSLY_USERNAME_ALLOWED_CHARS:
+        start += 1
+    while end > start and handle[end - 1] not in FANSLY_USERNAME_ALLOWED_CHARS:
+        end -= 1
+    cleaned = handle[start:end]
+    if not FANSLY_USERNAME_MIN_LEN <= len(cleaned) <= FANSLY_USERNAME_MAX_LEN:
+        return None
+    if set(cleaned) - FANSLY_USERNAME_ALLOWED_CHARS:
+        return None
+    return cleaned
+
+
+def performer_identity(entity: Account | PostMention) -> tuple[str, str] | None:
+    """Resolve ``(search_name, username)`` for a performer lookup.
+
+    ``None`` means the entity carries no usable Fansly username, which for a
+    ``PostMention`` is Fansly's bare-``@`` artifact (see
+    ``normalize_mention_handle``). Callers must skip those rather than look them
+    up or create from them.
+    """
+    if isinstance(entity, PostMention):
+        handle = normalize_mention_handle(entity.handle)
+        return (handle, handle) if handle else None
+    name = entity.displayName or entity.username
+    return (name, entity.username) if name and entity.username else None
 
 
 class AccountProcessingMixin(StashProcessingProtocol):
@@ -55,31 +113,27 @@ class AccountProcessingMixin(StashProcessingProtocol):
             print_warning(f"No account found for username: {self.state.creator_name}")
         return account
 
-    def _performer_from_account(self, account: Account) -> Performer:
+    def _performer_from_account(
+        self, account: Account | PostMention, name: str, username: str
+    ) -> Performer:
         """Create a Performer object from a Fansly Account (or PostMention).
 
         This is a local helper that maps Account model fields to the Performer
-        type from stash-graphql-client. Supports both Account (displayName,
-        username, about) and PostMention (handle) via duck-typing.
+        type from stash-graphql-client. ``name``/``username`` come from
+        ``performer_identity`` so a mention's handle is already normalized and
+        validated; passing them in keeps this from minting a performer named
+        after one of Fansly's mention-parser artifacts.
 
         Args:
             account: The Account or PostMention to convert
+            name: Display name for the new performer
+            username: Fansly username, used as alias and in the profile URL
 
         Returns:
             Performer object suitable for creating/updating in Stash.
             For new performers, the id field is omitted and auto-generates
             a UUID4 placeholder.
         """
-        # Use displayName as the primary name, fallback to username or handle
-        name = (
-            getattr(account, "displayName", None)
-            or getattr(account, "username", None)
-            or getattr(account, "handle", None)
-        )
-        username = getattr(account, "username", None) or getattr(
-            account, "handle", None
-        )
-
         # Build Fansly profile URL
         url = f"https://fansly.com/{username}"
 
@@ -91,28 +145,34 @@ class AccountProcessingMixin(StashProcessingProtocol):
             details=getattr(account, "about", "") or "",  # Biography/about text
         )
 
-    async def _get_or_create_performer(self, account: Account) -> Performer:
+    async def _get_or_create_performer(
+        self, account: Account | PostMention
+    ) -> Performer | None:
         """Get existing performer from Stash or create from account if not found.
 
         IMPORTANT: Performs deduplication checks (name→alias→URL) BEFORE creating.
         Pattern 1 migration: Use store.find_one() for identity map caching,
         preserving critical sequential deduplication logic.
 
+        The alias and URL steps are substring searches, so they must never run
+        with a blank value: Stash reads ``aliases INCLUDES ""`` as ``LIKE '%%'``
+        and returns the whole library, whose first row then gets silently
+        attached to the scene. ``performer_identity`` rejects the mentions that
+        would do that, and the per-step guards below keep any future caller from
+        reintroducing it.
+
         Args:
-            account: Account database model to search for or create from
+            account: Account or PostMention to search for or create from
 
         Returns:
-            Performer object from Stash (either found or newly created)
+            Performer object from Stash (either found or newly created), or
+            ``None`` when the entity carries no usable Fansly username.
         """
-        # Determine search criteria from account (or PostMention via duck-typing)
-        search_name = (
-            getattr(account, "displayName", None)
-            or getattr(account, "username", None)
-            or getattr(account, "handle", None)
-        )
-        username = getattr(account, "username", None) or getattr(
-            account, "handle", None
-        )
+        identity = performer_identity(account)
+        if identity is None:
+            logger.debug(f"Skipping performer lookup for unusable entity: {account!r}")
+            return None
+        search_name, username = identity
         fansly_url = f"https://fansly.com/{username}"
 
         # Cache-first: try sync filter() on preloaded performers before GraphQL.
@@ -129,7 +189,7 @@ class AccountProcessingMixin(StashProcessingProtocol):
             performer = await self.store.find_one(Performer, name__exact=search_name)
 
         # 2. Alias match (critical for deduplication)
-        if not performer:
+        if not performer and username:
             results = self.store.filter(
                 Performer,
                 lambda p: (
@@ -141,11 +201,13 @@ class AccountProcessingMixin(StashProcessingProtocol):
             if results:
                 logger.debug(f"Cache hit: performer by alias: {username}")
                 performer = results[0]
-        if not performer:
-            performer = await self.store.find_one(Performer, aliases__contains=username)
+            if not performer:
+                performer = await self.store.find_one(
+                    Performer, aliases__contains=username
+                )
 
         # 3. URL match (catches edge cases)
-        if not performer:
+        if not performer and username:
             results = self.store.filter(
                 Performer,
                 lambda p: (
@@ -155,15 +217,17 @@ class AccountProcessingMixin(StashProcessingProtocol):
             if results:
                 logger.debug(f"Cache hit: performer by URL: {fansly_url}")
                 performer = results[0]
-        if not performer:
-            performer = await self.store.find_one(Performer, url__contains=fansly_url)
+            if not performer:
+                performer = await self.store.find_one(
+                    Performer, url__contains=fansly_url
+                )
 
         if performer:
             return performer
 
         # Not found after all deduplication checks - create new performer
         logger.debug(f"Creating new performer for account: {username}")
-        performer = self._performer_from_account(account)
+        performer = self._performer_from_account(account, search_name, username)
         await self.store.save(performer)
         return performer
 
@@ -194,6 +258,10 @@ class AccountProcessingMixin(StashProcessingProtocol):
             logger.debug(f"Processing creator: {account.username}")
             # Get or create performer using intelligent fuzzy search
             performer = await self._get_or_create_performer(account)
+            if performer is None:  # pragma: no cover — a creator always has a username
+                raise ValueError(
+                    f"No usable Fansly username for creator: {account.username}"
+                )
             logger.debug(f"Obtained performer in Stash: {performer}")
             logger.debug(f"Context client (in process_creator): {self.context}")
 
