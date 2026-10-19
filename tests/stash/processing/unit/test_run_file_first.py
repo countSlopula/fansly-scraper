@@ -580,3 +580,42 @@ async def test_fast_path_known_media_reverifies_and_drops_from_index(
     assert set(item_entities) == {mock_item.id, post_b.id}
     assert media_with_id == [stamped]
     assert split_pairs == []
+
+
+@pytest.mark.asyncio
+async def test_persist_item_stash_ids_writes_gallery_ids(
+    entity_store, respx_stash_processor, mock_item, mock_account
+):
+    """An item's gallery id reaches the metadata DB, not just memory.
+
+    ``_get_or_create_gallery`` stamps ``item.stash_id`` for the O(1) lookup, but
+    until this step nothing wrote it back — so every later run (STASH_ONLY
+    especially) re-searched each gallery by code/title/URL. Items without a
+    gallery this run are skipped rather than written as NULL.
+    """
+    processor = respx_stash_processor
+    await entity_store.save(mock_account)
+    mock_item.accountId = mock_account.id
+    await entity_store.save(mock_item)
+
+    ungalleried = PostFactory.build(id=snowflake_id(), accountId=mock_account.id)
+    ungalleried.stash_id = None
+    await entity_store.save(ungalleried)
+
+    mock_item.stash_id = 5000
+    await processor._persist_item_stash_ids(
+        {
+            mock_item.id: (mock_item, []),
+            ungalleried.id: (ungalleried, []),
+        }
+    )
+
+    pool = await entity_store._get_pool()
+    assert (
+        await pool.fetchval("SELECT stash_id FROM posts WHERE id = $1", mock_item.id)
+        == 5000
+    )
+    assert (
+        await pool.fetchval("SELECT stash_id FROM posts WHERE id = $1", ungalleried.id)
+        is None
+    )

@@ -458,6 +458,8 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
         3. Compose galleries (per-item isolated) and flush them. Entities now
            carry real IDs, so a new gallery is created with its content attached
            in a single save() rather than created empty and linked later.
+        4. Persist the gallery ids onto their posts/messages — same reasoning as
+           step 2, and unconditional for the same reason.
 
         Any phase failure still re-raises, so the creator is reported failed
         rather than as a clean success. The flow is idempotent — entities that
@@ -469,6 +471,7 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
         gallery_error = await self._compose_and_flush_galleries(
             account, performer, studio, item_entities
         )
+        await self._persist_item_stash_ids(item_entities)
         if entity_error is not None:
             raise entity_error
         if gallery_error is not None:
@@ -530,6 +533,30 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
             except Exception as exc:
                 logger.exception(
                     f"Failed to persist stash_id for media {media.id}", exc_info=exc
+                )
+
+    async def _persist_item_stash_ids(
+        self,
+        item_entities: dict[int, tuple[Post | Message, list[Scene | Image]]],
+    ) -> None:
+        """Persist each item's gallery id to the FDNG metadata DB.
+
+        ``_get_or_create_gallery`` stamps ``item.stash_id`` in memory so the
+        gallery lookup is O(1), but nothing wrote it back — every later run
+        (STASH_ONLY especially) re-searched every gallery by code/title/URL and
+        risked composing a second one when a title had drifted. Same contract as
+        ``_persist_media_stash_ids``: best-effort, per-row isolated, and run even
+        after a failed gallery flush so the ids Stash DID accept are kept.
+        """
+        fdng_store = get_store()
+        for item, _entities in item_entities.values():
+            if item.stash_id is None:
+                continue
+            try:
+                await fdng_store.save(item)
+            except Exception as exc:
+                logger.exception(
+                    f"Failed to persist stash_id for item {item.id}", exc_info=exc
                 )
 
     async def _compose_and_flush_galleries(
