@@ -123,40 +123,32 @@ class MediaProcessingMixin(StashProcessingProtocol):
         temp-id) entities themselves. Returns an EMPTY list for any skip,
         unindexed, indeterminate, dry-run, or disabled path.
         """
-        if not is_set(file.path):
-            return []  # a swept file with no fetched path cannot be indexed — skip
-        leaf_name = PurePath(file.path).name
-        media_item = index.get(leaf_name)
+        # A swept file with no fetched path cannot be indexed, and a Stash file
+        # with no matching FDNG download has nothing to adjudicate against.
+        media_item = index.get(PurePath(file.path).name) if is_set(file.path) else None
         if media_item is None:
-            return []  # a Stash file with no matching FDNG download — skip
+            return []
         media, owners = media_item
         item = owners[0]  # earliest owner is canonical for the entity's metadata
 
-        if isinstance(file, VideoFile):
-            if media.mimetype and media.mimetype.startswith("image/"):
-                # An animated image (gif/webp/apng) is an Image backed by a
-                # VideoFile, which exposes no `.images` reverse — we cannot reach
-                # its Image to adjudicate. Skip (detect-and-log) rather than
-                # mis-route to scene-split, which would create a spurious Scene.
-                logger.warning(
-                    f"{leaf_name} (file {file.id}) is an animated "
-                    f"image (media {media.id}, {media.mimetype}) backed by a "
-                    f"VideoFile with no resolvable Image; skipping (no split)."
-                )
-            else:
-                owned = await self._owned_scene(file)
-                if owned is not None:
-                    await self._stamp_metadata(owned, media, item, account, studio)
-                    media.stash_id = int(owned.id)
-                    return [owned]
-                # Not-owned (secondary on a shared scene): split / dry-run / warn.
-                return await self._adjudicate_not_owned(
-                    file, media, item, account, studio
-                )
-        elif isinstance(file, ImageFile):
+        if isinstance(file, ImageFile):
             return await self._adjudicate_image(file, media, item, account, studio)
-        # GalleryFile / BasicFile, or the animated-image skip above -> ignore.
-        return []
+        if not isinstance(file, VideoFile):
+            return []  # GalleryFile / BasicFile -> ignore
+        if media.mimetype and media.mimetype.startswith("image/"):
+            # An animated image (gif/webp/apng) is an Image backed by a
+            # VideoFile; adjudicate it as an image (never scene-split, which
+            # would create a spurious Scene).
+            return await self._adjudicate_animated_image(
+                file, media, item, account, studio
+            )
+        owned = await self._owned_scene(file)
+        if owned is not None:
+            await self._stamp_metadata(owned, media, item, account, studio)
+            media.stash_id = int(owned.id)
+            return [owned]
+        # Not-owned (secondary on a shared scene): split / dry-run / warn.
+        return await self._adjudicate_not_owned(file, media, item, account, studio)
 
     async def _adjudicate_image(
         self,
@@ -175,11 +167,8 @@ class MediaProcessingMixin(StashProcessingProtocol):
         a shared scene). If every visual file is ours, we stamp and record
         ``media.stash_id``.
 
-        Path-resolution caveat: ``populate(image, ["visual_files"])`` does not
-        reliably resolve ``visual_files[].path`` (it can silently leave them
-        UNSET), so ownership is checked by re-fetching each Image fresh via the
-        find fragment — image IDs off ``file.images`` + ``get_many``, invalidating
-        first so a cached path-less copy is not read.
+        The Images using our file are read off the ``file.images`` reverse and
+        adjudicated by :meth:`_stamp_owned_images`.
         """
         if not is_set(file.path):
             raise ValueError(
@@ -188,12 +177,72 @@ class MediaProcessingMixin(StashProcessingProtocol):
         leaf_name = PurePath(file.path).name
         if not is_set(file.images):
             file = await self.store.populate(file, ["images"])  # REBIND
+        image_ids = [
+            image.id
+            for image in (file.images if is_set(file.images) and file.images else [])
+        ]
+        return await self._stamp_owned_images(
+            image_ids, leaf_name, media, item, account, studio
+        )
+
+    async def _adjudicate_animated_image(
+        self,
+        file: VideoFile,
+        media: Media,
+        item: Post | Message,
+        account: Account,
+        studio: Studio | None = None,
+    ) -> list[Scene | Image]:
+        """Adjudicate an animated image (gif/webp/apng) swept as a VideoFile.
+
+        Stash models an animated image as an Image whose visual file is a
+        ``VideoFile``, and ``VideoFile`` carries a ``scenes`` reverse but no
+        ``images`` one — so the owning Image is resolved by path instead.
+        Ownership then follows the same detect-and-log rule as a still image;
+        the file is never scene-split (that would create a spurious Scene for
+        what Stash holds as an Image).
+        """
+        if not is_set(file.path):
+            raise ValueError(
+                f"VideoFile {file.id} has no resolved path; cannot adjudicate "
+                f"animated image."
+            )
+        leaf_name = PurePath(file.path).name
+        image = await self.store.find_one(Image, path__contains=file.path)
+        if image is None:
+            logger.warning(
+                f"{leaf_name} (file {file.id}) is an animated image "
+                f"(media {media.id}, {media.mimetype}) with no Image in Stash; "
+                f"skipping (no split)."
+            )
+            return []
+        return await self._stamp_owned_images(
+            [image.id], leaf_name, media, item, account, studio
+        )
+
+    async def _stamp_owned_images(
+        self,
+        image_ids: Sequence[str],
+        leaf_name: str,
+        media: Media,
+        item: Post | Message,
+        account: Account,
+        studio: Studio | None = None,
+    ) -> list[Scene | Image]:
+        """Stamp each all-local Image of ``image_ids``; log and skip shared ones.
+
+        Shared by the still-image and animated-image branches. Each id is
+        re-fetched fresh because ``populate(image, ["visual_files"])`` does not
+        reliably resolve ``visual_files[].path`` (it can silently leave them
+        UNSET), so a cached path-less copy is invalidated first and the find
+        fragment re-read.
+        """
         stamped: list[Scene | Image] = []
-        for stale in file.images if is_set(file.images) and file.images else []:
+        for image_id in image_ids:
             # Evict any cached copy (whose visual_files paths may be UNSET) so the
             # find-fragment re-fetch returns visual_files WITH paths resolved.
-            self.store.invalidate(Image, stale.id)
-            fresh = await self.store.get_many(Image, [stale.id])
+            self.store.invalidate(Image, image_id)
+            fresh = await self.store.get_many(Image, [image_id])
             image = fresh[0] if fresh else None
             if image is None or not self._image_files_all_local(image):
                 # Foreign co-resident OR ownership unresolvable -> fail safe: skip.
@@ -207,7 +256,7 @@ class MediaProcessingMixin(StashProcessingProtocol):
                     )
                 )
                 logger.error(
-                    f"Image {stale.id} for {leaf_name} has a "
+                    f"Image {image_id} for {leaf_name} has a "
                     f"foreign co-resident (or paths unresolved); not stamping "
                     f"shared image. Files: {[getattr(vf, 'path', None) for vf in files]}"
                 )

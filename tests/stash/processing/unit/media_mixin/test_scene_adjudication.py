@@ -1,5 +1,6 @@
 """Unit tests for MediaProcessingMixin._owned_scene and _stamp_metadata."""
 
+import io
 import json
 from pathlib import PurePath
 from typing import Any
@@ -7,15 +8,21 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from loguru import logger as loguru_logger
 from stash_graphql_client import is_set, present
 from stash_graphql_client.types import Scene, SceneCreateInput, VideoFile
 
 from tests.fixtures.metadata.metadata_factories import MediaFactory
-from tests.fixtures.stash import graphql_op_fired
+from tests.fixtures.stash import (
+    graphql_op_fired,
+    seed_processor_caches,
+    stash_creator_root,
+)
 from tests.fixtures.stash.stash_api_fixtures import dump_graphql_calls
 from tests.fixtures.stash.stash_graphql_fixtures import (
     create_find_scenes_result,
     create_graphql_response,
+    create_image_dict,
     create_scene_dict,
     create_video_file_dict,
 )
@@ -488,36 +495,104 @@ class TestProcessFileFirst:
         assert getattr(scene, "code", None) == original_code
 
     @pytest.mark.asyncio
-    async def test_animated_image_videofile_skips_no_split(
+    async def test_animated_image_videofile_resolves_image_and_stamps(
         self, respx_stash_processor, mock_item, mock_account
     ):
-        """An animated image (image/* media) backed by a VideoFile is skipped.
+        """An animated image (image/* media) backed by a VideoFile is stamped.
 
-        VideoFile exposes no ``.images`` reverse, so the backing Image cannot be
-        resolved; routing it to the scene path would spuriously SPLIT in True
-        mode. The dispatcher detects the image mimetype and skips. Discriminator:
-        result == [] AND zero GraphQL — an empty side_effect makes any call
-        (e.g. the not-owned force-refetch the old path would issue) raise.
+        Stash holds a gif/webp/apng as an Image whose visual file is a
+        ``VideoFile``. ``VideoFile`` has no ``.images`` reverse, so the owning
+        Image is resolved by path (findImages) and then adjudicated exactly like
+        a still image. Discriminator: the image is stamped and ``media.stash_id``
+        recorded, with NO scene query — scene-split is left True, so a
+        mis-route to the scene path would create a spurious Scene instead.
         """
-        file = VideoFile(id="100", path="/dl/u/anim_id_42.gif")
+        root = stash_creator_root(respx_stash_processor)
+        file = VideoFile(id="100", path=f"{root}/test_user/anim_id_42.gif")
         media = MediaFactory.build(
             is_downloaded=True, mimetype="image/gif", local_filename="anim_id_42.gif"
         )
         index = {PurePath(present(file.path)).name: (media, [mock_item])}
         respx_stash_processor.config.stash_enable_scene_split = True
 
-        graphql_route = respx.post("http://localhost:9999/graphql").mock(side_effect=[])
+        # The Image's lone visual file IS the swept VideoFile — all-local, so
+        # real _image_files_all_local returns True and the stamp proceeds.
+        image_data = create_image_dict(
+            id="900",
+            visual_files=[
+                create_video_file_dict("100", f"{root}/test_user/anim_id_42.gif")
+            ],
+        )
+        studio = seed_processor_caches(respx_stash_processor, mock_account)
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=[
+                # 1) resolve the Image by path (the VideoFile has no .images).
+                httpx.Response(
+                    200,
+                    json=create_graphql_response(
+                        "findImages", {"count": 1, "images": [image_data]}
+                    ),
+                ),
+                # 2) the ownership re-fetch (paths resolved via find fragment).
+                httpx.Response(
+                    200, json=create_graphql_response("findImage", image_data)
+                ),
+            ]
+        )
+        try:
+            result = await respx_stash_processor._process_file_first(
+                file, index, mock_account, studio
+            )
+        finally:
+            dump_graphql_calls(graphql_route.calls, "animated_image_stamps")
+
+        assert len(result) == 1
+        stamped = result[0]
+        assert stamped.id == "900"
+        assert stamped.code == str(media.id)
+        assert media.stash_id == 900
+        # Adjudicated as an image: no scene was queried or created.
+        assert not graphql_op_fired(graphql_route.calls, "findScenes")
+        assert not graphql_op_fired(graphql_route.calls, "sceneCreate")
+
+    @pytest.mark.asyncio
+    async def test_animated_image_without_stash_image_warns_no_split(
+        self, respx_stash_processor, mock_item, mock_account
+    ):
+        """No Image in Stash for the gif → warn and skip, never scene-split."""
+        root = stash_creator_root(respx_stash_processor)
+        file = VideoFile(id="100", path=f"{root}/test_user/anim_id_42.gif")
+        media = MediaFactory.build(
+            is_downloaded=True, mimetype="image/gif", local_filename="anim_id_42.gif"
+        )
+        index = {PurePath(present(file.path)).name: (media, [mock_item])}
+        respx_stash_processor.config.stash_enable_scene_split = True
+
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=[
+                httpx.Response(
+                    200,
+                    json=create_graphql_response(
+                        "findImages", {"count": 0, "images": []}
+                    ),
+                )
+            ]
+        )
+        sink = io.StringIO()
+        sink_id = loguru_logger.add(sink, level="WARNING")
         try:
             result = await respx_stash_processor._process_file_first(
                 file, index, mock_account, None
             )
         finally:
-            dump_graphql_calls(graphql_route.calls, "animated_image_videofile_skips")
+            loguru_logger.remove(sink_id)
+            dump_graphql_calls(graphql_route.calls, "animated_image_no_image")
 
-        # Detected by mimetype and skipped before any scene query.
         assert result == []
-        assert len(graphql_route.calls) == 0
         assert media.stash_id is None
+        assert "animated image" in sink.getvalue()
+        # The unresolvable gif is skipped, not routed to the scene path.
+        assert not graphql_op_fired(graphql_route.calls, "findScenes")
 
 
 class TestSplitSceneForFile:
