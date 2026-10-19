@@ -24,7 +24,7 @@ import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
 from datetime import timedelta
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Any, TypedDict, TypeVar
 
 import asyncpg
@@ -40,6 +40,7 @@ from .models import (
     AccountMedia,
     AccountMediaBundle,
     Attachment,
+    ContentType,
     FanslyObject,
     FanslyRecord,
     Group,
@@ -53,6 +54,7 @@ from .models import (
     PinnedPost,
     Post,
     PostMention,
+    RelationshipMetadata,
     TimelineStats,
     Wall,
     get_from_cache_by_type_name,
@@ -837,7 +839,9 @@ class PostgresEntityStore:
            entity's own row before recursing into related entities.
         2. INSERT/UPDATE the entity itself (scalar columns only,
            junction sync happens after related entities are saved).
-        3. Sync junction table rows (both sides now exist in DB).
+        3. Persist ``cascade_save`` reverse-FK children (attachments,
+           mentions) — their FK points at this row, which now exists.
+        4. Sync junction table rows (both sides now exist in DB).
         """
         # Step 1: INSERT/UPDATE entity row (scalars only, no junctions yet)
         if obj._is_new:
@@ -862,11 +866,135 @@ class PostgresEntityStore:
             elif isinstance(related, FanslyObject) and related._is_new:
                 await self.save(related)
 
-        # Step 3: Sync junction table rows (both sides now exist in DB)
+        # Step 3: Persist reverse-FK children that live only on this payload
+        await self._sync_reverse_fk_children(obj)
+
+        # Step 4: Sync junction table rows (both sides now exist in DB)
         await self._sync_assoc_tables(obj)
 
         self.cache_instance(obj)
         obj.mark_clean()
+
+    async def _sync_reverse_fk_children(self, obj: FanslyObject) -> None:
+        """Persist ``has_many(cascade_save=True)`` children of a saved parent.
+
+        Post/Message attachments and post mentions arrive only as nested
+        payload on their parent and have no processing path of their own, so
+        the parent's save is the only chance to write them. Without this they
+        live in the identity map for the run and then vanish: a later
+        STASH_ONLY run preloads posts with no attachments, the media index
+        comes up empty, and the whole creator is silently skipped.
+
+        Never treats an EMPTY list as a deletion signal — a parent loaded cold
+        from the DB has no children hydrated, and reading that as "the API
+        dropped them" would delete perfectly good rows.
+        """
+        if obj.id is None:
+            return
+        for field_name, meta in type(obj).__relationships__.items():
+            if not meta.cascade_save or meta.query_strategy != "reverse_fk":
+                continue
+            children = getattr(obj, field_name, None)
+            if not isinstance(children, list) or not children:
+                continue
+            await self._reconcile_children(obj, meta, children)
+
+    async def _reconcile_children(
+        self,
+        parent: FanslyObject,
+        meta: RelationshipMetadata,
+        children: list[FanslyObject],
+    ) -> None:
+        """Reconcile a parent's reverse-FK child rows against its current list.
+
+        The children carry auto-increment ids the API never sends, so a fresh
+        payload cannot be matched by id — matching goes through the child's
+        ``__natural_key__`` instead, which keeps re-saving the same payload a
+        no-op instead of inserting a duplicate set every run. Rows for this
+        parent whose natural key is no longer present are deleted, so a removed
+        attachment stops feeding galleries.
+
+        Per-child isolation: a child the DB refuses (e.g. a second mention
+        resolving to the same account, against post_mentions' UNIQUE
+        (postId, accountId)) is logged and skipped rather than failing the
+        parent's whole save.
+        """
+        child_type = type(children[0])
+        natural_key = child_type.__natural_key__
+        fk_column = meta.fk_column
+        if not natural_key or not fk_column:
+            # Nothing to match rows on — writing blind would duplicate them.
+            return
+
+        for child in children:
+            if getattr(child, fk_column, None) != parent.id:
+                setattr(child, fk_column, parent.id)
+
+        # Already-persisted children with no pending changes: the list came
+        # from the DB (or an earlier save this run), so there is nothing to
+        # reconcile and the round trip is pure cost.
+        if all(
+            child.id is not None and not child._is_new and not child.is_dirty()
+            for child in children
+        ):
+            return
+
+        table_name = child_type.__table_name__
+        pk_col = self._pk_column(child_type)
+        pool = await self._get_pool()
+        columns = ", ".join(self._q(c) for c in (pk_col, *natural_key))
+        rows = await pool.fetch(
+            f"SELECT {columns} FROM {table_name} WHERE {self._q(fk_column)} = $1",
+            parent.id,
+        )
+        existing = {tuple(row[col] for col in natural_key): row[pk_col] for row in rows}
+
+        seen: set[tuple[Any, ...]] = set()
+        for child in children:
+            key = self._natural_key_of(child, natural_key)
+            seen.add(key)
+            row_id = existing.get(key)
+            if row_id is not None and child.id is None:
+                # Adopt the existing row so the save UPDATEs it in place
+                # instead of inserting a second copy of the same attachment.
+                child.id = row_id
+                child._is_new = False
+            try:
+                await self.save(child)
+            except Exception as exc:
+                db_logger.warning(
+                    f"Failed to persist {child_type.__name__} "
+                    f"{key} for {type(parent).__name__} {parent.id}: {exc}"
+                )
+
+        stale = [row_id for key, row_id in existing.items() if key not in seen]
+        if stale:
+            await pool.execute(
+                f"DELETE FROM {table_name} WHERE {self._q(pk_col)} = ANY($1)",
+                stale,
+            )
+            for row_id in stale:
+                self.invalidate(child_type, row_id)
+
+    @staticmethod
+    def _natural_key_of(
+        obj: FanslyObject, natural_key: tuple[str, ...]
+    ) -> tuple[Any, ...]:
+        """Read a child's natural key in DB representation.
+
+        Mirrors ``to_db_dict``'s enum handling so the tuple compares equal to
+        what asyncpg returns for the same row (ContentType is a native PG enum
+        storing member names, not values).
+        """
+        values: list[Any] = []
+        for field in natural_key:
+            value = getattr(obj, field, None)
+            if isinstance(value, ContentType):
+                value = value.name
+            elif isinstance(value, Enum):
+                value = value.value
+            values.append(value)
+        return tuple(values)
 
     async def _insert_row(self, obj: FanslyObject) -> None:
         """INSERT scalar columns only (no junction sync)."""

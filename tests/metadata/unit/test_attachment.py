@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from metadata import Account, Attachment, ContentType, Message, Post
-from metadata.models import AccountMedia, AccountMediaBundle
+from metadata.models import AccountMedia, AccountMediaBundle, PostMention
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
@@ -160,6 +160,125 @@ def test_attachment_content_resolution():
 
     assert att_story.is_account_media is False
     assert att_story.is_account_media_bundle is False
+
+
+@pytest.mark.asyncio
+async def test_post_attachments_persist_across_processes(entity_store):
+    """Post attachments reach the DB, not just the in-run identity map.
+
+    A STASH_ONLY run has no download phase to rebuild the object graph — it
+    preloads from the DB and reconstructs Post.attachments from the rows. When
+    the rows were never written the media index came up empty and the creator
+    was silently skipped, so this asserts the rows themselves.
+    """
+    store = entity_store
+    pool = await store._get_pool()
+
+    account_id = snowflake_id()
+    await store.save(Account(id=account_id, username="cascade_user"))
+
+    post_id = snowflake_id()
+    kept, dropped = snowflake_id(), snowflake_id()
+    payload = {
+        "id": post_id,
+        "accountId": account_id,
+        "content": "Post with media",
+        "createdAt": 1700000000,
+        "attachments": [
+            {"contentId": kept, "contentType": 1, "pos": 0},
+            {"contentId": dropped, "contentType": 1, "pos": 1},
+            {"contentId": snowflake_id(), "contentType": 7, "pos": 2},  # TIP
+        ],
+    }
+    await store.save(Post.model_validate(payload))
+
+    rows = await pool.fetch('SELECT * FROM attachments WHERE "postId" = $1', post_id)
+    assert {r["contentId"] for r in rows} == {kept, dropped}
+    assert all(r["contentType"] == "ACCOUNT_MEDIA" for r in rows)
+
+    # Re-processing the same timeline must not duplicate the rows.
+    await store.save(Post.model_validate(payload))
+    rows_again = await pool.fetch(
+        'SELECT * FROM attachments WHERE "postId" = $1', post_id
+    )
+    assert {r["id"] for r in rows_again} == {r["id"] for r in rows}
+
+    # An attachment the API no longer sends stops feeding galleries.
+    await store.save(
+        Post.model_validate(
+            {
+                **payload,
+                "attachments": [{"contentId": kept, "contentType": 1, "pos": 0}],
+            }
+        )
+    )
+    rows_after = await pool.fetch(
+        'SELECT * FROM attachments WHERE "postId" = $1', post_id
+    )
+    assert [r["contentId"] for r in rows_after] == [kept]
+
+    # A cold-loaded parent carries no children — that is "not hydrated", not
+    # "the API dropped them", and must never delete rows.
+    cold = Post(id=post_id, accountId=account_id, content="cold")
+    cold._is_new = False
+    await store.save(cold)
+    assert await pool.fetchval(
+        'SELECT count(*) FROM attachments WHERE "postId" = $1', post_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_attachments_persist(entity_store):
+    """Message attachments cascade the same way, keyed on messageId."""
+    store = entity_store
+    pool = await store._get_pool()
+
+    account_id = snowflake_id()
+    await store.save(Account(id=account_id, username="msg_user"))
+    msg_id = snowflake_id()
+    content_id = snowflake_id()
+    await store.save(
+        Message.model_validate(
+            {
+                "id": msg_id,
+                "senderId": account_id,
+                "content": "hi",
+                "createdAt": datetime.now(UTC),
+                "attachments": [{"contentId": content_id, "contentType": 1, "pos": 0}],
+            }
+        )
+    )
+
+    rows = await pool.fetch('SELECT * FROM attachments WHERE "messageId" = $1', msg_id)
+    assert [r["contentId"] for r in rows] == [content_id]
+
+
+@pytest.mark.asyncio
+async def test_child_rejected_by_db_does_not_fail_parent(entity_store):
+    """One unwritable child must not cost the parent (or its siblings).
+
+    post_mentions carries a UNIQUE (postId, accountId), so two mentions that
+    resolve to the same account collide — the second is dropped with a warning
+    while the post and the first mention still land.
+    """
+    store = entity_store
+    pool = await store._get_pool()
+
+    account_id = snowflake_id()
+    mentioned_id = snowflake_id()
+    await store.save(Account(id=account_id, username="mention_user"))
+    post_id = snowflake_id()
+    post = Post(id=post_id, accountId=account_id, content="mentions")
+    await store.save(post)
+
+    post.mentions = [
+        PostMention(postId=post_id, accountId=mentioned_id, handle="first"),
+        PostMention(postId=post_id, accountId=mentioned_id, handle="collides"),
+    ]
+    await store.save(post)
+
+    rows = await pool.fetch('SELECT * FROM post_mentions WHERE "postId" = $1', post_id)
+    assert [r["handle"] for r in rows] == ["first"]
 
 
 def test_attachment_exclusivity():

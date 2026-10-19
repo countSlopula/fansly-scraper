@@ -122,6 +122,8 @@ class RelationshipMetadata:
         assoc_table: Association table name for M2M relationships
         fk_column: FK column name for direct FK relationships
         auto_sync: DB maintains referential integrity via FK constraints
+        cascade_save: Saving the parent also persists these children (see
+            ``PostgresEntityStore._sync_reverse_fk_children``)
         notes: Additional implementation notes
     """
 
@@ -139,6 +141,7 @@ class RelationshipMetadata:
         fk_column: str | None = None,
         ordered: bool = False,
         auto_sync: bool = True,
+        cascade_save: bool = False,
         notes: str = "",
     ) -> None:
         self.target_field = target_field
@@ -163,6 +166,7 @@ class RelationshipMetadata:
         self.fk_column = fk_column
         self.ordered = ordered
         self.auto_sync = auto_sync
+        self.cascade_save = cascade_save
         self.notes = notes
 
     def __repr__(self) -> str:
@@ -332,6 +336,7 @@ def has_many(
     fk_column: str,
     inverse_query_field: str | None = None,
     target_field: str | None = None,
+    cascade_save: bool = False,
     notes: str = "",
 ) -> RelationshipMetadata:
     """Reverse FK — other model has FK pointing here (list).
@@ -341,6 +346,11 @@ def has_many(
     Auto-derives (via __init_subclass__):
         - query_field: from dict key
         - target_field: singularize(key) + "_ids"
+
+    ``cascade_save=True`` marks children that exist ONLY as nested payload on
+    the parent (attachments, mentions) — they have no processing path of their
+    own, so the parent's save is the only chance to persist them. The child
+    model must declare ``__natural_key__`` for the reconcile to match rows.
 
     Examples::
 
@@ -357,6 +367,7 @@ def has_many(
         inverse_query_field=inverse_query_field,
         query_strategy="reverse_fk",
         fk_column=fk_column,
+        cascade_save=cascade_save,
         notes=notes,
     )
 
@@ -461,6 +472,11 @@ class FanslyObject(BaseModel):
     __relationships__: ClassVar[dict[str, RelationshipMetadata]] = {}
     __tracked_fields__: ClassVar[set[str]] = set()
     __fk_to_rel__: ClassVar[dict[str, tuple[str, RelationshipMetadata]]] = {}
+    # Columns that identify a row when the PK cannot: children saved through a
+    # ``has_many(cascade_save=True)`` parent carry an auto-increment id the API
+    # never sends, so re-saving the same payload has to match on content
+    # instead. Empty means "not reconcilable" — the cascade skips the type.
+    __natural_key__: ClassVar[tuple[str, ...]] = ()
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Resolve _DEFERRED fields in __relationships__ from dict keys.
@@ -1600,6 +1616,13 @@ class Attachment(FanslyObject):
     """An attachment to a post or message, referencing content by type."""
 
     __table_name__: ClassVar[str] = "attachments"
+    # The API sends no id: a row is identified by its owner + slot + content.
+    __natural_key__: ClassVar[tuple[str, ...]] = (
+        "postId",
+        "messageId",
+        "contentId",
+        "pos",
+    )
     __tracked_fields__: ClassVar[set[str]] = {
         "postId",
         "messageId",
@@ -1702,6 +1725,7 @@ class PostMention(FanslyObject):
     """
 
     __table_name__: ClassVar[str] = "post_mentions"
+    __natural_key__: ClassVar[tuple[str, ...]] = ("postId", "handle")
     __tracked_fields__: ClassVar[set[str]] = {
         "postId",
         "accountId",
@@ -1753,12 +1777,12 @@ class Post(FanslyObject):
         "account": belongs_to("Account", fk_column="accountId"),
         "replyTo": belongs_to("Post", fk_column="inReplyTo"),
         "replyToRoot": belongs_to("Post", fk_column="inReplyToRoot"),
-        "attachments": has_many("Attachment", fk_column="postId"),
+        "attachments": has_many("Attachment", fk_column="postId", cascade_save=True),
         "hashtags": habtm(
             "Hashtag", assoc_table="post_hashtags", inverse_query_field="posts"
         ),
         "walls": habtm("Wall", assoc_table="wall_posts", inverse_query_field="posts"),
-        "mentions": has_many("PostMention", fk_column="postId"),
+        "mentions": has_many("PostMention", fk_column="postId", cascade_save=True),
     }
 
     @model_validator(mode="before")
@@ -1842,7 +1866,7 @@ class Message(FanslyObject):
         "group": belongs_to("Group", fk_column="groupId"),
         "sender": belongs_to("Account", fk_column="senderId"),
         "recipient": belongs_to("Account", fk_column="recipientId"),
-        "attachments": has_many("Attachment", fk_column="messageId"),
+        "attachments": has_many("Attachment", fk_column="messageId", cascade_save=True),
     }
 
     @model_validator(mode="before")
