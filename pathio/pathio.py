@@ -118,8 +118,10 @@ def set_create_directory_for_download(config: PathConfig, state: DownloadState) 
 def get_creator_base_path(config: PathConfig, creator_name: str) -> Path:
     """Get the base path for a creator's content.
 
-    This function checks for existing case-insensitive matches to avoid
-    creating duplicate directories on case-sensitive filesystems.
+    Returns the directory as it is actually spelled on disk: an existing entry
+    matching *creator_name* case-insensitively wins over the requested casing,
+    which avoids creating duplicate directories on case-sensitive filesystems
+    and avoids returning a differently-cased path on case-insensitive ones.
 
     Args:
         config: The program configuration
@@ -134,14 +136,30 @@ def get_creator_base_path(config: PathConfig, creator_name: str) -> Path:
         raise RuntimeError("Download directory is not set in configuration.")
     target_path = config.download_directory / target_name
 
-    # Check for existing case-insensitive match
-    if not target_path.exists():
-        lower_target = target_name.lower()
+    # Resolve against the real directory listing rather than trusting
+    # `target_path.exists()`: on a case-insensitive backing store (NFS/SMB,
+    # macOS) `exists()` is True for `Example_fansly` when the directory on disk
+    # is `example_fansly`, and the differently-cased path would then be returned
+    # verbatim. Callers compare it as a *string* prefix against Stash's paths
+    # (which carry the on-disk casing), so the wrong spelling silently breaks
+    # ownership checks. An exact-name entry always wins; a case-insensitive one
+    # is the fallback.
+    lower_target = target_name.lower()
+    ci_match: Path | None = None
+    try:
         for entry in config.download_directory.iterdir():
-            if entry.is_dir() and entry.name.lower() == lower_target:
+            if entry.name == target_name:
                 return entry
+            if (
+                ci_match is None
+                and entry.name.lower() == lower_target
+                and entry.is_dir()
+            ):
+                ci_match = entry
+    except OSError:
+        return target_path
 
-    return target_path
+    return ci_match if ci_match is not None else target_path
 
 
 def get_creator_metadata_path(config: PathConfig, creator_name: str) -> Path:

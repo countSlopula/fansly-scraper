@@ -159,6 +159,25 @@ class TestPathIO:
         # Real iterdir loop returns the differently-cased directory.
         assert result == creator_dir
 
+    def test_get_creator_base_path_case_insensitive_backing_store(self, tmp_path):
+        """A case-insensitive backing store must not leak the requested casing.
+
+        On NFS/SMB (and macOS) ``exists()`` answers True for ``Creator_fansly``
+        while the directory on disk is ``creator_fansly``. Callers compare the
+        returned path as a string prefix against Stash's paths, which carry the
+        on-disk casing, so the requested spelling must never win over a real
+        entry. ``Path.exists`` is stubbed True to emulate that filesystem.
+        """
+        creator_dir = tmp_path / "creator_fansly"
+        creator_dir.mkdir()
+
+        config = MockPathConfig(use_folder_suffix=True, download_directory=tmp_path)
+
+        with mock.patch.object(Path, "exists", return_value=True):
+            result = get_creator_base_path(config, "Creator")
+
+        assert result == creator_dir
+
     def test_get_creator_base_path_with_folder_suffix(self, tmp_path):
         """Test get_creator_base_path with folder suffix enabled."""
         config = MockPathConfig(use_folder_suffix=True, download_directory=tmp_path)
