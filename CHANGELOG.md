@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Auto-generated `user<accountId>` creator names load again.** The config-load username validator mirrored Fansly's client-side sign-up rule verbatim, including its 20-character cap, so a creator who never picked a handle — Fansly assigns `user` plus an 18-19 digit account snowflake, 22-23 characters in all; a Chinese creator was found using one — made `config.yaml` fail to load outright with `has length 22; Fansly requires 4-20 characters`. The cap is now 30 (the bound the interactive validator already used), and both validators share one set of constants so they cannot drift apart again. The charset rule is unchanged.
+
 ## [0.15.1] - 2026-07-14
 
 ### Added

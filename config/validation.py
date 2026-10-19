@@ -23,6 +23,7 @@ from .config import (
     username_has_valid_length,
 )
 from .fanslyconfig import FanslyConfig
+from .schema import FANSLY_USERNAME_MAX_LEN, FANSLY_USERNAME_MIN_LEN
 
 
 async def validate_creator_names(config: FanslyConfig) -> bool:
@@ -106,7 +107,9 @@ async def validate_adjust_creator_name(
 
         if not usern_error and not username_has_valid_length(name):
             textio_logger.warning(
-                f"{usern_base_text} must be between 4 and 30 characters long!\n"
+                f"{usern_base_text} must be between "
+                f"{FANSLY_USERNAME_MIN_LEN} and {FANSLY_USERNAME_MAX_LEN} "
+                f"characters long!\n"
             )
             usern_error = True
 

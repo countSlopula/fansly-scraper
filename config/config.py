@@ -8,7 +8,12 @@ from typing import Any
 from config.fanslyconfig import FanslyConfig
 from config.loader import load_or_migrate
 from config.logging import init_logging_config, set_debug_enabled, textio_logger
-from config.schema import ConfigSchema
+from config.schema import (
+    FANSLY_USERNAME_ALLOWED_CHARS,
+    FANSLY_USERNAME_MAX_LEN,
+    FANSLY_USERNAME_MIN_LEN,
+    ConfigSchema,
+)
 from errors import ConfigError
 
 
@@ -72,16 +77,14 @@ def username_has_valid_length(name: str | None) -> bool:
     if name is None:
         return False
 
-    return len(name) >= 4 and len(name) <= 30
+    return FANSLY_USERNAME_MIN_LEN <= len(name) <= FANSLY_USERNAME_MAX_LEN
 
 
 def username_has_valid_chars(name: str | None) -> bool:
     if name is None:
         return False
 
-    invalid_chars = set(name) - set(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-    )
+    invalid_chars = set(name) - FANSLY_USERNAME_ALLOWED_CHARS
 
     return not invalid_chars
 

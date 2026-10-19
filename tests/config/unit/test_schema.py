@@ -195,10 +195,12 @@ class TestUsernameFormatValidator:
     """Coverage for the Fansly-rules username validator on
     ``TargetedCreatorSection.usernames``.
 
-    Mirrors the client-side ``verifyUsername`` at
-    ``main_beautified.js:50717``: length 4-20, charset
-    ``[a-zA-Z0-9_-]``. Catches operator typos at config-load time
-    instead of letting them fail silently at runtime as "creator
+    Charset mirrors the client-side ``verifyUsername`` at
+    ``main_beautified.js:50717``: ``[a-zA-Z0-9_-]``. The length bound
+    is deliberately looser than the client's 20-char sign-up cap
+    (4-30) because Fansly's own auto-generated ``user<accountId>``
+    handles are 22-23 chars. Catches operator typos at config-load
+    time instead of letting them fail silently at runtime as "creator
     never matches the predicate".
     """
 
@@ -215,13 +217,19 @@ class TestUsernameFormatValidator:
                 "user-name",  # hyphen
                 "1234",  # all digits at min length (Fansly allows numeric)
                 "abcd",  # exactly min length 4
-                "a" * 20,  # exactly max length 20
+                "a" * 30,  # exactly max length 30
+                # Fansly's auto-generated handle for a creator who never
+                # picked one: ``user`` + an 18-digit account snowflake.
+                # 22 chars — past the client's 20-char sign-up cap, but a
+                # real, subscribable creator (a Chinese creator was found
+                # using one). The digits here are made up.
+                "user123456789012345678",
                 "_legit_underscores_",  # underscores at boundaries
                 "-edge-case-",  # hyphens at boundaries (Fansly allows)
             ]
         )
         assert section.usernames is not None
-        assert len(section.usernames) == 10
+        assert len(section.usernames) == 11
 
     def test_length_below_minimum_rejected(self) -> None:
         """Three chars or fewer fails with a length-message
@@ -233,8 +241,8 @@ class TestUsernameFormatValidator:
                 TargetedCreatorSection(usernames=[too_short])
 
     def test_length_above_maximum_rejected(self) -> None:
-        """21+ chars fails with a length-message ValidationError."""
-        too_long = "a" * 21
+        """31+ chars fails with a length-message ValidationError."""
+        too_long = "a" * 31
         with pytest.raises(ValidationError, match=r"length"):
             TargetedCreatorSection(usernames=[too_long])
 

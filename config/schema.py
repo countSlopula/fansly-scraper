@@ -178,11 +178,20 @@ class _BaseSection(BaseModel):
 # typo (``...xzy...`` instead of ``...xyz...``); functionally harmless
 # because the JS checks via ``indexOf`` (membership, not ordering). We
 # replicate the *intent* with a corrected character set.
-_FANSLY_USERNAME_ALLOWED_CHARS: frozenset[str] = frozenset(
+FANSLY_USERNAME_ALLOWED_CHARS: frozenset[str] = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 )
-_FANSLY_USERNAME_MIN_LEN: int = 4
-_FANSLY_USERNAME_MAX_LEN: int = 20
+FANSLY_USERNAME_MIN_LEN: int = 4
+# The 20-char cap in ``verifyUsername`` only governs handles a human *picks*
+# at sign-up. Fansly also issues auto-generated handles of the form
+# ``user<accountId>``, where the account id is an 18-19 digit snowflake —
+# 22-23 chars, well past the sign-up cap. A Chinese creator was found using
+# one, which is why the limit was raised: these are real, subscribable
+# creators, so the loader must accept them or a valid ``usernames:`` entry
+# becomes an unloadable config. 30 matches the runtime
+# check in ``config.config.username_has_valid_length`` (which imports this
+# constant) and leaves headroom for a 19-digit id.
+FANSLY_USERNAME_MAX_LEN: int = 30
 
 
 class TargetedCreatorSection(_BaseSection):
@@ -233,21 +242,24 @@ class TargetedCreatorSection(_BaseSection):
         matches the predicate at runtime". Mirrors the client-side
         check at ``main_beautified.js:50717``.
 
-        Rules (verified 2026-05-14 against the JS source):
-          - Length: ``4 <= len <= 20`` chars
+        Rules (charset verified 2026-05-14 against the JS source):
+          - Length: ``4 <= len <= 30`` chars. The JS caps sign-up
+            handles at 20, but Fansly's own auto-generated
+            ``user<accountId>`` handles run 22-23 chars, so the upper
+            bound here is deliberately looser than the client's.
           - Charset: ``[a-zA-Z0-9_-]`` (alphanumeric, underscore, hyphen)
         """
         if v is None:
             return None
         for username in v:
             length = len(username)
-            if length < _FANSLY_USERNAME_MIN_LEN or length > _FANSLY_USERNAME_MAX_LEN:
+            if length < FANSLY_USERNAME_MIN_LEN or length > FANSLY_USERNAME_MAX_LEN:
                 raise ValueError(
                     f"username {username!r} has length {length}; Fansly "
-                    f"requires {_FANSLY_USERNAME_MIN_LEN}-"
-                    f"{_FANSLY_USERNAME_MAX_LEN} characters"
+                    f"requires {FANSLY_USERNAME_MIN_LEN}-"
+                    f"{FANSLY_USERNAME_MAX_LEN} characters"
                 )
-            bad_chars = sorted(set(username) - _FANSLY_USERNAME_ALLOWED_CHARS)
+            bad_chars = sorted(set(username) - FANSLY_USERNAME_ALLOWED_CHARS)
             if bad_chars:
                 raise ValueError(
                     f"username {username!r} contains characters Fansly "
