@@ -26,6 +26,7 @@ from fileio.dedupe import (
     get_filename_only,
     get_or_create_media,
     migrate_full_paths_to_filenames,
+    rename_legacy_hash2_file,
     safe_rglob,
 )
 from fileio.normalize import normalize_filename
@@ -171,6 +172,69 @@ async def test_get_account_id(entity_store):
     state.creator_name = None
     result = await get_account_id(state)
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_rename_legacy_hash2_file_renames_to_canonical(tmp_path):
+    """A legacy hash2 file is renamed to the name the media is recorded under.
+
+    The database records the hash-stripped, UTC-normalized name while the file
+    on disk kept the hash — and every Stash lookup matches on the exact
+    basename, so the file was never adjudicated. After the rename disk and
+    database agree.
+    """
+    hash2_pattern = re.compile(r"_hash2_([a-fA-F0-9]+)")
+    media_id = snowflake_id()
+    original = create_test_file(
+        tmp_path, f"2023-05-01_at_12-30_UTC_id_{media_id}_hash2_deadbeef.jpg"
+    )
+
+    result = await rename_legacy_hash2_file(original, hash2_pattern)
+
+    expected = tmp_path / f"2023-05-01_at_12-30_UTC_id_{media_id}.jpg"
+    assert result == expected
+    assert expected.exists()
+    assert not original.exists()
+    # The recorded name is the name on disk (what the Stash index keys on).
+    assert await normalize_filename(result.name) == result.name
+
+
+@pytest.mark.asyncio
+async def test_rename_legacy_hash2_file_keeps_both_when_target_exists(tmp_path):
+    """An existing canonical twin is never overwritten; both files survive."""
+    hash2_pattern = re.compile(r"_hash2_([a-fA-F0-9]+)")
+    media_id = snowflake_id()
+    twin = create_test_file(
+        tmp_path, f"2023-05-01_at_12-30_UTC_id_{media_id}.jpg", b"canonical"
+    )
+    original = create_test_file(
+        tmp_path,
+        f"2023-05-01_at_12-30_UTC_id_{media_id}_hash2_deadbeef.jpg",
+        b"legacy",
+    )
+
+    result = await rename_legacy_hash2_file(original, hash2_pattern)
+
+    # Neither file moved, and the record keeps the name the file actually has.
+    assert result == original
+    assert original.exists()
+    assert twin.read_bytes() == b"canonical"
+
+
+@pytest.mark.asyncio
+async def test_rename_legacy_hash2_file_survives_os_error(tmp_path):
+    """A rename the OS refuses falls back to the original path, no raise."""
+    hash2_pattern = re.compile(r"_hash2_([a-fA-F0-9]+)")
+    media_id = snowflake_id()
+    original = create_test_file(
+        tmp_path, f"2023-05-01_at_12-30_UTC_id_{media_id}_hash2_deadbeef.jpg"
+    )
+
+    with patch.object(Path, "rename", side_effect=OSError("read-only filesystem")):
+        result = await rename_legacy_hash2_file(original, hash2_pattern)
+
+    assert result == original
+    assert original.exists()
 
 
 @pytest.mark.asyncio
@@ -483,6 +547,16 @@ async def test_dedupe_init_full_pipeline(entity_store, config, tmp_path):
 
     updated_no_name = await store.get(Media, no_name_media.id)
     assert updated_no_name.is_downloaded is False
+
+    # The legacy hash2 file was renamed on disk to the name recorded for it.
+    # Every Stash lookup keys on the exact basename, so the two must agree —
+    # recording the stripped name while leaving the hash on disk is what made
+    # these files invisible to adjudication.
+    assert not (dl_dir / f"photo_hash2_abc123def456_id_{mid1}.jpg").exists()
+    canonical = dl_dir / f"photo_id_{mid1}.jpg"
+    assert canonical.exists()
+    hash2_media = await store.get(Media, mid1)
+    assert hash2_media.local_filename == canonical.name
 
 
 @pytest.mark.asyncio

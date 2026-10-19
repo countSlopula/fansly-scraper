@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - **Configurable Stash request timeout (`stash_context.request_timeout_s`, default 300 s).** A creator's Scene/Image/Gallery writes flush in batches of up to 250 mutations per GraphQL request, which on a large creator (or a Stash across the network) runs well past the client library's hardcoded 30 s — the run then dies with `Request to http://…/graphql timed out` after every file has already been downloaded. The library's own `Timeout` connection key never reaches it (`StashContext` drops every key except Scheme/Host/Port/ApiKey/Logger), so the configured value is applied to the connected client's gql `execute_timeout` and httpx transport instead.
+- **Legacy `_hash2_` files are renamed to their canonical name.** Downloads from the v0.8/v0.9 era embed the content hash in the filename while the database records the hash-stripped name, so no basename-keyed Stash lookup ever matched them. Deduplication now renames the file on disk and records the name it actually has. The rename never overwrites an existing file, and a file that cannot be renamed keeps (and is recorded under) its old name. Stash identifies files by content hash, so the next scan sees a move and each scene keeps its o-count and play history — but until that scan the files show as missing, so do not run Stash's Clean task in between.
 
 ### Fixed
 

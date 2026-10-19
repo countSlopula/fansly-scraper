@@ -185,6 +185,58 @@ def calculate_file_hash(
     return file_path, None, debug_info
 
 
+async def rename_legacy_hash2_file(
+    file_path: Path,
+    hash2_pattern: re.Pattern[str],
+    config: FanslyConfig | None = None,
+) -> Path:
+    """Rename a legacy ``_hash2_`` file to the canonical name recorded for it.
+
+    ng-era (v0.8/v0.9) downloads embed the content hash in the filename. This
+    fork records the media under the hash-stripped, UTC-normalized name while
+    the file on disk keeps the hash, and every Stash identity check matches on
+    the exact basename (``_build_media_index``, ``_process_file_first``,
+    ``_locate_file_by_leaf``) — so the divergence silently stops the file from
+    ever being adjudicated. Renaming makes disk and database agree.
+
+    The rename is non-destructive: an existing file is never overwritten, and a
+    file that cannot be renamed keeps its hash2 name (which the caller then
+    records verbatim, since ``normalize_filename`` leaves hashed names alone —
+    so disk and database still agree).
+
+    Args:
+        file_path: The on-disk ``_hash2_`` file.
+        hash2_pattern: Compiled ``_hash2_<hex>`` pattern.
+        config: Program configuration (drives timestamp normalization).
+
+    Returns:
+        The path to record the media under: the canonical one when the rename
+        succeeded, the original otherwise.
+    """
+    stripped = file_path.with_name(hash2_pattern.sub("", file_path.name))
+    canonical = stripped.with_name(
+        await normalize_filename(get_filename_only(stripped), config=config)
+    )
+    if canonical == file_path:
+        return file_path
+    if await asyncio.to_thread(canonical.exists):
+        # A canonical twin is already on disk (the same content downloaded
+        # again). Never clobber it — keep both files and record this one under
+        # the name it actually has.
+        json_output(
+            1,
+            "rename_legacy_hash2_file",
+            {"state": "target_exists", "file": str(file_path)},
+        )
+        return file_path
+    try:
+        await asyncio.to_thread(file_path.rename, canonical)
+    except OSError as e:
+        print_warning(f"Could not rename legacy hash2 file {file_path.name}: {e}")
+        return file_path
+    return canonical
+
+
 async def get_or_create_media(
     file_path: Path,
     media_id: int | None,
@@ -577,6 +629,7 @@ async def dedupe_init(
     # Initialize patterns and counters
     processed_count = 0
     preserved_count = 0
+    renamed_paths: dict[Path, Path] = {}
     hash2_pattern = re.compile(r"_hash2_([a-fA-F0-9]+)")
 
     # Use half of available cores, but ensure at least 2 workers
@@ -622,9 +675,16 @@ async def dedupe_init(
                 show_elapsed=False,
             )
             for file_path, media_id, mimetype, hash2_value in file_batches["hash2"]:
-                new_name = hash2_pattern.sub("", file_path.name)
+                # Rename on disk FIRST, then record the name the file now has —
+                # recording a name the file does not carry is what left these
+                # files unmatchable by every basename-keyed Stash lookup.
+                record_path = await rename_legacy_hash2_file(
+                    file_path, hash2_pattern, config
+                )
+                if record_path != file_path:
+                    renamed_paths[file_path] = record_path
                 _, hash_verified = await get_or_create_media(
-                    file_path=file_path.with_name(new_name),
+                    file_path=record_path,
                     media_id=media_id,
                     mimetype=mimetype,
                     state=state,
@@ -635,6 +695,16 @@ async def dedupe_init(
                 if hash_verified:
                     preserved_count += 1
                 progress_mgr.update_task(hash2_task, advance=1)
+        if renamed_paths:
+            # The sweep snapshot predates the renames; refresh it so the DB
+            # verification below finds the renamed files and does not wipe the
+            # records it just wrote (it matches on basename against this list).
+            all_files = [renamed_paths.get(f, f) for f in all_files]
+            print_info(
+                f"Renamed {len(renamed_paths)} legacy hash2 file(s) to their "
+                f"canonical names (Stash matches files by content hash, so a "
+                f"re-scan sees a move and keeps each scene's metadata)."
+            )
 
     # Process files with media IDs in parallel
     if file_batches["media_id"]:
