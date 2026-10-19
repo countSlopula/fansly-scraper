@@ -446,19 +446,124 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
         media_with_id: list[Media],
         split_pairs: list[tuple[Media, Scene]],
     ) -> None:
-        """Compose one gallery per owning item, then flush once and persist.
+        """Flush adjudicated entities, then compose one gallery per owning item.
 
-        save_all is all-or-nothing; a batch failure re-raises so the creator is
-        reported failed (not a clean success with stash_ids silently lost). The
-        flow is idempotent — a failed creator self-heals on the next run.
+        Ordered so a failure can never leave persistent damage in Stash:
+
+        1. Flush the stamped Scenes/Images and any split scenes FIRST. No gallery
+           exists yet, so a failure here cannot orphan one.
+        2. Persist ``media.stash_id`` for whatever landed — unconditionally, so a
+           later gallery failure does not discard bookkeeping the server already
+           accepted.
+        3. Compose galleries (per-item isolated) and flush them. Entities now
+           carry real IDs, so a new gallery is created with its content attached
+           in a single save() rather than created empty and linked later.
+
+        Any phase failure still re-raises, so the creator is reported failed
+        rather than as a clean success. The flow is idempotent — entities that
+        failed in phase 1 stay dirty and are retried by phase 3's flush, and a
+        failed creator self-heals on the next run.
         """
-        for item, entities in item_entities.values():
-            # Per-item isolation: one bad compose must not abort the rest.
+        entity_error = await self._flush_adjudicated_entities(split_pairs)
+        await self._persist_media_stash_ids(media_with_id, split_pairs)
+        gallery_error = await self._compose_and_flush_galleries(
+            account, performer, studio, item_entities
+        )
+        if entity_error is not None:
+            raise entity_error
+        if gallery_error is not None:
+            raise gallery_error
+
+    async def _flush_adjudicated_entities(
+        self,
+        split_pairs: list[tuple[Media, Scene]],
+    ) -> Exception | None:
+        """Flush stamped/split entities and stamp split ids. Returns the error.
+
+        Runs before any gallery is created so a batch failure cannot leave an
+        empty gallery behind. Returns the exception instead of raising so the
+        caller can still persist the stash_ids that DID land.
+        """
+        try:
+            await self.store.save_all()
+        except Exception as exc:
+            print_error(f"Failed to flush adjudicated Stash entities: {exc}")
+            logger.exception("Failed to flush adjudicated Stash entities", exc_info=exc)
+            debug_print(
+                {
+                    "method": "StashProcessing - run_file_first",
+                    "status": "entity_flush_failed",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+            return exc
+        finally:
+            # Split scenes that were actually created now carry a real ID (a
+            # partial batch failure leaves the rest new — those keep a temp UUID
+            # and must not be int()'d onto the Media).
+            for media, scene in split_pairs:
+                if not scene.is_new():
+                    media.stash_id = int(scene.id)
+        return None
+
+    async def _persist_media_stash_ids(
+        self,
+        media_with_id: list[Media],
+        split_pairs: list[tuple[Media, Scene]],
+    ) -> None:
+        """Persist affected Media rows to the FDNG metadata DB (not Stash).
+
+        Best-effort and per-row isolated: this is bookkeeping for writes Stash
+        already accepted, so one bad row must not cost the rest. Dropping a
+        stash_id is not fatal (the next run re-adjudicates via the sweep) but it
+        forces avoidable rediscovery, so it is worth saving even on a failed run.
+        Dedupe by object identity so each Media is saved once.
+        """
+        fdng_store = get_store()
+        affected = media_with_id + [m for m, _ in split_pairs]
+        for media in {id(m): m for m in affected}.values():
+            if media.stash_id is None:
+                continue
             try:
-                await self._compose_gallery_for_item(
+                await fdng_store.save(media)
+            except Exception as exc:
+                logger.exception(
+                    f"Failed to persist stash_id for media {media.id}", exc_info=exc
+                )
+
+    async def _compose_and_flush_galleries(
+        self,
+        account: Account,
+        performer: Performer,
+        studio: Studio | None,
+        item_entities: dict[int, tuple[Post | Message, list[Scene | Image]]],
+    ) -> Exception | None:
+        """Compose and persist one gallery per owning item. Returns the error.
+
+        Each item's gallery is saved as it is composed, not deferred into one
+        creator-wide batch. A pre-existing gallery receives its new content via
+        the ``addGalleryImages`` side-mutation, and SGC only fires side mutations
+        after every main mutation in the batch has succeeded — so in a single
+        batch one transport-level failure (a blip against a remote Stash) drops
+        the links for EVERY gallery in the run. Saving per item bounds that loss
+        to the one item and lets a long run make durable partial progress.
+        """
+        first_error: Exception | None = None
+        for item, entities in item_entities.values():
+            # Per-item isolation: one bad compose/save must not abort the rest.
+            try:
+                gallery = await self._compose_gallery_for_item(
                     item, entities, account, performer, studio
                 )
+                if gallery is not None:
+                    # No-op for a gallery just created by _get_or_create_gallery
+                    # (already saved clean with its content); this is the flush
+                    # for an EXISTING gallery that gained links/tags.
+                    await self.store.save(gallery)
             except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 print_error(f"Failed to compose gallery for item {item.id}: {exc}")
                 logger.exception(
                     f"Failed to compose gallery for item {item.id}", exc_info=exc
@@ -473,32 +578,23 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
                     }
                 )
         try:
-            # Creates split scenes, updates owned scenes/images, creates/links
-            # galleries (links ride save_all via gallery side-mutations).
+            # Sweep-up: chapters, tags created along the way, and any entity left
+            # dirty by a failed phase-1 flush (a free retry).
             await self.store.save_all()
-
-            # Post-flush: split scenes now have real IDs — record on the Media.
-            for media, scene in split_pairs:
-                media.stash_id = int(scene.id)
-
-            # Persist affected Media rows to the FDNG metadata DB (NOT the Stash
-            # store). Dedupe by object identity so each Media is saved once.
-            fdng_store = get_store()
-            affected = media_with_id + [m for m, _ in split_pairs]
-            for media in {id(m): m for m in affected}.values():
-                await fdng_store.save(media)
         except Exception as exc:
-            print_error(f"Failed to flush file-first batch: {exc}")
-            logger.exception("Failed to flush file-first batch", exc_info=exc)
+            print_error(f"Failed to flush gallery batch: {exc}")
+            logger.exception("Failed to flush gallery batch", exc_info=exc)
             debug_print(
                 {
                     "method": "StashProcessing - run_file_first",
-                    "status": "batch_flush_failed",
+                    "status": "gallery_flush_failed",
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
                 }
             )
-            raise
+            if first_error is None:
+                first_error = exc
+        return first_error
 
     async def _compose_gallery_for_item(
         self,
@@ -507,13 +603,14 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
         account: Account,
         performer: Performer,
         studio: Studio | None,
-    ) -> None:
-        """Get-or-create the item's gallery and link its adjudicated entities.
+    ) -> Gallery | None:
+        """Get-or-create the item's gallery with its adjudicated entities linked.
 
-        Linking: hashtags become tags, Images ride ``gallery.images``
-        (addGalleryImages side-mutation), Scenes are added via ``add_scene``.
-        No explicit save here — the gallery is already dirty and its links flush
-        on the run-level ``save_all``.
+        Linking is done by ``_get_or_create_gallery`` via
+        ``_link_gallery_contents`` so that a NEW gallery is created with its
+        content already attached (one save()), instead of being persisted empty
+        and linked by a later flush that may never land. An EXISTING gallery is
+        returned dirty for the caller to save.
 
         Args:
             item: The owning Post or Message
@@ -521,6 +618,9 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
             account: The Account being processed
             performer: The Performer for the account
             studio: Optional Studio to associate with the gallery
+
+        Returns:
+            The item's Gallery, or None when the item has no media content.
         """
         if isinstance(item, Post):
             item_type = "post"
@@ -529,23 +629,12 @@ class FileFirstProcessingMixin(StashProcessingProtocol):
             item_type = "message"
             url_pattern = f"https://fansly.com/messages/{item.groupId}/{item.id}"
 
-        gallery = await self._get_or_create_gallery(
+        return await self._get_or_create_gallery(
             item=item,
             account=account,
             performer=performer,
             studio=studio,
             item_type=item_type,
             url_pattern=url_pattern,
+            entities=entities,
         )
-        if not gallery:
-            return
-
-        hashtags = getattr(item, "hashtags", None)
-        if hashtags:
-            for tag in await self._process_hashtags_to_tags(hashtags):
-                await gallery.add_tag(tag)
-
-        existing_images = gallery.images if isinstance(gallery.images, list) else []
-        gallery.images = existing_images + [e for e in entities if isinstance(e, Image)]
-        for scene in [e for e in entities if isinstance(e, Scene)]:
-            await gallery.add_scene(scene)

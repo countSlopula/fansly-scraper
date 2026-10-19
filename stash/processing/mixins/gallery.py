@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from typing import TYPE_CHECKING
 
 from stash_graphql_client.types import (
     Gallery,
     GalleryChapter,
+    Image,
     Performer,
+    Scene,
     Studio,
     is_set,
 )
@@ -16,7 +19,12 @@ from stash_graphql_client.types import (
 from metadata import Account, ContentType, Post
 
 from ...logging import debug_print
+from ...logging import processing_logger as logger
 from ..protocols import HasMetadata, StashProcessingProtocol
+
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 class GalleryProcessingMixin(StashProcessingProtocol):
@@ -224,7 +232,69 @@ class GalleryProcessingMixin(StashProcessingProtocol):
             organized=True,  # Mark as organized since we have metadata
             performers=[],  # Initialize as empty list to avoid UnsetType
             tags=[],  # Initialize as empty list to avoid UnsetType
+            # images/scenes are linked before the first persist (see
+            # _link_gallery_contents). They must start as lists, not UNSET:
+            # add_scene()/add_image() would otherwise try to populate() the
+            # reverse field off the server for a gallery whose id is still a
+            # temp UUID.
+            images=[],
+            scenes=[],
         )
+
+    async def _link_gallery_contents(
+        self,
+        gallery: Gallery,
+        item: HasMetadata,
+        entities: Sequence[Scene | Image],
+    ) -> None:
+        """Attach the item's hashtag tags and adjudicated Images/Scenes.
+
+        Mutates ``gallery`` in place and leaves it dirty. For a brand-new gallery
+        this runs BEFORE the first ``store.save``, so the create and the
+        ``addGalleryImages`` side-mutation ride the same save() — a gallery is
+        never persisted in an empty, contentless state. For an existing gallery
+        the caller (``_compose_and_flush_galleries``) saves it right after.
+
+        Args:
+            gallery: Gallery to attach to
+            item: Source item supplying hashtags
+            entities: Adjudicated Scene/Image entities for this item
+        """
+        hashtags = getattr(item, "hashtags", None)
+        if hashtags:
+            for tag in await self._process_hashtags_to_tags(hashtags):
+                await gallery.add_tag(tag)
+
+        # An entity still flagged new never made it past the entity flush (its
+        # create failed), so it holds a temp UUID rather than a Stash id. Linking
+        # it would put that UUID in scene_ids/image ids — a rejected mutation or,
+        # worse, a cascade-save that duplicates the entity. Drop it; the next run
+        # re-adjudicates the file and links it then.
+        linkable: list[Scene | Image] = []
+        for entity in entities:
+            if entity.is_new():
+                logger.warning(
+                    f"Not linking unsaved {entity.__class__.__name__} "
+                    f"{entity.id} into gallery {gallery.id} — its create did not "
+                    f"land this run; deferring to the next run."
+                )
+                continue
+            linkable.append(entity)
+
+        # Images ride the `images` side-mutation, which diffs current vs.
+        # snapshot by id — merge (don't clobber) whatever is already attached,
+        # and only touch the field when there is something new to add.
+        new_images = [e for e in linkable if isinstance(e, Image)]
+        if new_images:
+            existing = gallery.images if isinstance(gallery.images, list) else []
+            merged = {img.id: img for img in existing}
+            for image in new_images:
+                merged.setdefault(image.id, image)
+            if len(merged) != len(existing):
+                gallery.images = list(merged.values())
+
+        for scene in [e for e in linkable if isinstance(e, Scene)]:
+            await gallery.add_scene(scene)
 
     async def _get_gallery_metadata(
         self,
@@ -365,8 +435,9 @@ class GalleryProcessingMixin(StashProcessingProtocol):
         studio: Studio | None,
         item_type: str,  # noqa: ARG002
         url_pattern: str,
+        entities: Sequence[Scene | Image] | None = None,
     ) -> Gallery | None:
-        """Get or create a gallery for an item.
+        """Get or create a gallery for an item, with its contents attached.
 
         Args:
             item: The item to process
@@ -375,10 +446,14 @@ class GalleryProcessingMixin(StashProcessingProtocol):
             studio: The Studio object
             _item_type: Type of item ("post" or "message") - reserved for future use
             url_pattern: URL pattern for the item
+            entities: Adjudicated Scene/Image entities to link into the gallery.
+                Linked BEFORE a new gallery's first persist so the gallery never
+                exists in Stash without its content (see _link_gallery_contents).
 
         Returns:
             Gallery object or None if creation fails or item has no media
         """
+        contents = entities or []
         # Only create/get gallery if there's media content
         if not await self._has_media_content(item):
             debug_print(
@@ -402,6 +477,8 @@ class GalleryProcessingMixin(StashProcessingProtocol):
             lambda: self._get_gallery_by_url(item, url),
         ]:
             if gallery := await method():
+                # Existing gallery: returned dirty; the caller saves it per item.
+                await self._link_gallery_contents(gallery, item, contents)
                 return gallery
 
         # Create new gallery if none found
@@ -416,6 +493,12 @@ class GalleryProcessingMixin(StashProcessingProtocol):
 
         # Set URLs (url field is deprecated, use urls)
         gallery.urls = [url]
+
+        # Attach tags/images/scenes BEFORE the first persist so the create and
+        # the addGalleryImages side-mutation ride ONE save(). Persisting first
+        # and linking later leaves a fully-formed but EMPTY gallery behind
+        # whenever the deferred flush fails.
+        await self._link_gallery_contents(gallery, item, contents)
 
         # Save gallery so it gets a real Stash ID (required for chapter gallery_id)
         await self.store.save(gallery)

@@ -195,16 +195,23 @@ async def test_run_file_first_stamps_and_composes_galleries(
         # --- Outcome 1: media stamped this run (stash_id assigned + persisted). ---
         media_with_stash_id = [m for m in all_seeded_media if m.stash_id]
 
-        # --- Outcome 2: galleries created AND their links rode save_all. ---
+        # --- Outcome 2: galleries created AND linked at creation time. ---
         gallery_create_ops = [c for c in calls if "galleryCreate" in c.get("query", "")]
-        # Product contract, timing-independent: the link mutations fired in the
-        # batched flush. Asserted off the captured wire (not a server re-fetch)
-        # so it cannot race Stash's SQLite read-after-write visibility.
+        # Product contract, timing-independent: a gallery is never persisted
+        # without its content. Content arrives one of two ways, both tied to the
+        # gallery's own save() — Images via the addGalleryImages side-mutation
+        # that save() fires right after the create, Scenes as scene_ids carried
+        # in the create input itself. Asserted off the captured wire (not a
+        # server re-fetch) so it cannot race Stash's read-after-write visibility.
         link_ops = [
             c
             for c in calls
             if "addGalleryImages" in c.get("query", "")
             or "addGalleryScenes" in c.get("query", "")
+            or (
+                "galleryCreate" in c.get("query", "")
+                and (c.get("variables") or {}).get("input", {}).get("scene_ids")
+            )
         ]
 
         # Server-state confirmation, SQLite-lag-tolerant: a burst of
@@ -243,15 +250,16 @@ async def test_run_file_first_stamps_and_composes_galleries(
             "sweep adjudicates nothing — check base_path vs seeded paths.)"
         )
 
-        # If galleries were created, their links MUST have ridden save_all (there
-        # is NO explicit per-gallery save in _compose_gallery_for_item). Assert on
-        # the link mutations off the wire — the SQLite-lagged re-fetch above is a
-        # supplementary confirmation, not the gate.
+        # If galleries were created, their content MUST have been attached by the
+        # same save() that created them — content is linked BEFORE the first
+        # persist (_link_gallery_contents), precisely so a later flush failure
+        # cannot strand a titled-but-empty gallery in Stash. Assert on the wire —
+        # the SQLite-lagged re-fetch above is supplementary, not the gate.
         if gallery_create_ops:
             assert link_ops, (
-                f"{len(gallery_create_ops)} galleries created but no "
-                "addGalleryImages/addGalleryScenes mutation fired — links did "
-                "not ride the batched flush."
+                f"{len(gallery_create_ops)} galleries created but neither an "
+                "addGalleryImages/addGalleryScenes mutation nor scene_ids on the "
+                "create input — a gallery was persisted with no content."
             )
 
         # --- Stamping proof: an owned image got metadata stamped in place. ---

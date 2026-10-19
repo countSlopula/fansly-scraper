@@ -11,6 +11,7 @@ is routed via respx:
    creator as a clean success with stash_ids lost.
 """
 
+import json
 from pathlib import PurePath
 
 import httpx
@@ -137,14 +138,21 @@ async def test_run_file_first_isolates_failing_file(
         )
 
     gallery = create_gallery_dict(id="5000", title="Good")
-    # Exact 10-call sequence (the loop survives the bad file's raise):
+    # Exact 9-call sequence (the loop survives the bad file's raise):
     #  [0] sweep findFiles (bad, good)
     #  [1] BAD file _owned_scene populate → findScenes(bad) → error → isolated
     #  [2][3] GOOD file _owned_scene populate → findScenes(good) (direct + nested)
     #         → good is files[0] → OWNED → stamp scene + media.stash_id
-    #  [4][5][6] gallery find-or-create probes findGalleries (code/title/url) empty
-    #  [7] galleryCreate (new gallery id 5000) → [8] findGallery(5000) re-fetch
-    #  [9] save_all Batch(op0: SceneUpdateInput) — the stamped scene flush
+    #  [4] entity save_all Batch(op0: SceneUpdateInput) — the stamped scene flush.
+    #      Entities flush BEFORE any gallery exists, so a failure here cannot
+    #      leave an empty gallery behind.
+    #  [5][6][7] gallery find-or-create probes findGalleries (code/title/url) empty
+    #  [8] galleryCreate — carries scene_ids=[700]: the scene link rides the
+    #      CREATE, so the gallery is never persisted without its content. (The
+    #      old link-after-create path needed a 10th call, findGallery(5000), to
+    #      populate gallery.scenes before appending to it.)
+    #  The gallery save_all that follows is a no-op (nothing left dirty) and
+    #  issues no request.
     route = respx.post(_GRAPHQL_URL).mock(
         side_effect=[
             find_files_response(
@@ -154,12 +162,11 @@ async def test_run_file_first_isolates_failing_file(
             error,
             _scenes_good(),
             _scenes_good(),
+            httpx.Response(200, json={"data": {"op0": good_scene}}),
             _galleries_empty(),
             _galleries_empty(),
             _galleries_empty(),
             httpx.Response(200, json=create_graphql_response("galleryCreate", gallery)),
-            httpx.Response(200, json=create_graphql_response("findGallery", gallery)),
-            httpx.Response(200, json={"data": {"op0": good_scene, "op1": gallery}}),
         ]
     )
 
@@ -212,6 +219,238 @@ async def test_run_file_first_propagates_batch_flush_failure(
     assert raised is not None, (
         "save_all failure was swallowed — _run_file_first reported the creator "
         "clean despite a failed Stash batch write"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gallery_is_never_created_without_its_content(
+    entity_store, respx_stash_processor, mock_item, mock_account
+):
+    """A ``galleryCreate`` always carries the item's content. Regression guard.
+
+    The bug this locks out: ``_get_or_create_gallery`` used to persist a new
+    gallery (title/code/date/urls/studio/performers) and only afterwards attach
+    tags/images/scenes, leaving those links to the run-level ``save_all``. When
+    that deferred flush died — a remote Stash blip is enough, and SGC's
+    ``save_batch`` only catches ``StashBatchError``, so a
+    ``StashConnectionError``/``StashServerError`` skips side mutations for the
+    WHOLE batch — the gallery stayed behind fully titled and totally empty. This
+    produced hundreds of such galleries on a live library.
+
+    Here the entity flush is routed to a server error (the realistic trigger).
+    The flow must still refuse to persist a contentless gallery: every
+    ``galleryCreate`` on the wire must carry ``scene_ids``.
+    """
+    processor = respx_stash_processor
+    root = get_stash_path(processor.state.base_path, processor.config).rstrip("/")
+    acct_id = snowflake_id()
+    account = AccountFactory.build(id=acct_id, username="test_user")
+    await entity_store.save(account)
+
+    scene_path = f"{root}/test_user/vid_id_1.mp4"
+    media = MediaFactory.build(
+        id=snowflake_id(),
+        accountId=acct_id,
+        mimetype="video/mp4",
+        is_downloaded=True,
+        local_filename="vid_id_1.mp4",
+    )
+    await entity_store.save(media)
+    await entity_store.save(
+        AccountMediaFactory.build(id=media.id, accountId=acct_id, mediaId=media.id)
+    )
+    post = PostFactory.build(id=snowflake_id(), accountId=acct_id)
+    await entity_store.save(post)
+    await entity_store.save(
+        AttachmentFactory.build(
+            id=snowflake_id(),
+            postId=post.id,
+            contentId=media.id,
+            contentType=ContentType.ACCOUNT_MEDIA,
+            pos=0,
+        )
+    )
+
+    processor._account = mock_account
+    processor._performer = PerformerFactory(
+        id="123", name="test_user", scenes=[], images=[], galleries=[]
+    )
+    studio = StudioFactory(id="200", name="test_user (Fansly)")
+
+    owned_scene = create_scene_dict(
+        id="900",
+        title="Owned",
+        files=[create_video_file_dict("30", scene_path)],
+    )
+    scenes_ok = httpx.Response(
+        200,
+        json=create_graphql_response(
+            "findScenes", create_find_scenes_result(count=1, scenes=[owned_scene])
+        ),
+    )
+    galleries_empty = httpx.Response(
+        200,
+        json=create_graphql_response("findGalleries", {"count": 0, "galleries": []}),
+    )
+    gallery = create_gallery_dict(id="6000", title="Owned")
+
+    #  [0] sweep findFiles → [1][2] _owned_scene findScenes (direct + nested)
+    #  [3] entity save_all → SERVER ERROR (the injected failure)
+    #  [4][5][6] gallery probes (code/title/url) empty → [7] galleryCreate
+    route = respx.post(_GRAPHQL_URL).mock(
+        side_effect=[
+            find_files_response(create_video_file_dict("30", scene_path)),
+            scenes_ok,
+            scenes_ok,
+            httpx.Response(
+                200, json={"errors": [{"message": "simulated entity flush failure"}]}
+            ),
+            galleries_empty,
+            galleries_empty,
+            galleries_empty,
+            httpx.Response(200, json=create_graphql_response("galleryCreate", gallery)),
+        ]
+    )
+
+    raised: Exception | None = None
+    try:
+        await processor._run_file_first(account, processor._performer, studio)
+    except Exception as exc:
+        raised = exc
+    finally:
+        dump_graphql_calls(route.calls, "gallery_never_created_empty")
+
+    # The failure is still surfaced — resilience must not mean silence.
+    assert raised is not None, (
+        "entity flush failure was swallowed — the creator would be reported "
+        "clean despite a failed Stash batch write"
+    )
+
+    creates = [
+        json.loads(call.request.content)
+        for call in route.calls
+        if "galleryCreate" in json.loads(call.request.content).get("query", "")
+    ]
+    assert creates, "no galleryCreate fired — test did not reach gallery composition"
+    for body in creates:
+        gallery_input = body["variables"]["input"]
+        assert gallery_input.get("scene_ids"), (
+            "galleryCreate persisted a gallery with NO content "
+            f"(input keys: {sorted(gallery_input)}). A new gallery must be "
+            "created with its scenes/images already attached, or a failed flush "
+            "strands a titled-but-empty gallery in Stash."
+        )
+
+
+@pytest.mark.asyncio
+async def test_existing_empty_gallery_is_repaired_and_saved_immediately(
+    entity_store, respx_stash_processor, mock_item, mock_account
+):
+    """An already-empty gallery gets its content and is saved per item.
+
+    This is the recovery path for galleries the old link-after-create bug
+    already stranded: found by ``code``, they must gain the adjudicated entity
+    and be flushed as part of THIS item, not parked in a creator-wide batch
+    whose side mutations all die together on one transport error.
+
+    Discriminator: a ``galleryUpdate`` carrying ``scene_ids`` reaches the wire
+    without any run-level batch being needed.
+    """
+    processor = respx_stash_processor
+    root = get_stash_path(processor.state.base_path, processor.config).rstrip("/")
+    acct_id = snowflake_id()
+    account = AccountFactory.build(id=acct_id, username="test_user")
+    await entity_store.save(account)
+
+    scene_path = f"{root}/test_user/vid_id_9.mp4"
+    media = MediaFactory.build(
+        id=snowflake_id(),
+        accountId=acct_id,
+        mimetype="video/mp4",
+        is_downloaded=True,
+        local_filename="vid_id_9.mp4",
+    )
+    await entity_store.save(media)
+    await entity_store.save(
+        AccountMediaFactory.build(id=media.id, accountId=acct_id, mediaId=media.id)
+    )
+    post = PostFactory.build(id=snowflake_id(), accountId=acct_id)
+    await entity_store.save(post)
+    await entity_store.save(
+        AttachmentFactory.build(
+            id=snowflake_id(),
+            postId=post.id,
+            contentId=media.id,
+            contentType=ContentType.ACCOUNT_MEDIA,
+            pos=0,
+        )
+    )
+
+    processor._account = mock_account
+    processor._performer = PerformerFactory(
+        id="123", name="test_user", scenes=[], images=[], galleries=[]
+    )
+    studio = StudioFactory(id="200", name="test_user (Fansly)")
+
+    owned_scene = create_scene_dict(
+        id="950",
+        title="Owned",
+        files=[create_video_file_dict("40", scene_path)],
+    )
+    scenes_ok = httpx.Response(
+        200,
+        json=create_graphql_response(
+            "findScenes", create_find_scenes_result(count=1, scenes=[owned_scene])
+        ),
+    )
+    # The stranded gallery: right code, ZERO content — exactly the kind found on
+    # the live library.
+    empty_gallery = create_gallery_dict(
+        id="7000",
+        title="Stranded",
+        code=str(post.id),
+        scenes=[],
+        images=[],
+    )
+
+    #  [0] findFiles → [1][2] _owned_scene findScenes → [3] entity save_all batch
+    #  [4] findGalleries(code) HITS the stranded gallery → [5] galleryUpdate
+    route = respx.post(_GRAPHQL_URL).mock(
+        side_effect=[
+            find_files_response(create_video_file_dict("40", scene_path)),
+            scenes_ok,
+            scenes_ok,
+            httpx.Response(200, json={"data": {"op0": owned_scene}}),
+            httpx.Response(
+                200,
+                json=create_graphql_response(
+                    "findGalleries", {"count": 1, "galleries": [empty_gallery]}
+                ),
+            ),
+            httpx.Response(
+                200, json=create_graphql_response("galleryUpdate", empty_gallery)
+            ),
+        ]
+    )
+
+    try:
+        await processor._run_file_first(account, processor._performer, studio)
+    finally:
+        dump_graphql_calls(route.calls, "existing_empty_gallery_repaired")
+
+    updates = [
+        body
+        for call in route.calls
+        if "galleryUpdate"
+        in (body := json.loads(call.request.content)).get("query", "")
+    ]
+    assert updates, (
+        "no galleryUpdate fired — the stranded empty gallery was found but its "
+        "content was never persisted, so it stays empty"
+    )
+    assert updates[0]["variables"]["input"].get("scene_ids") == ["950"], (
+        "galleryUpdate did not carry the adjudicated scene: "
+        f"{updates[0]['variables']['input']}"
     )
 
 

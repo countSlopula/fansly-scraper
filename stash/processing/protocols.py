@@ -230,7 +230,15 @@ class StashProcessingProtocol(Protocol):
         studio: Studio | None,
         item_type: str,
         url_pattern: str,
+        entities: Sequence[Scene | Image] | None = None,
     ) -> Gallery | None: ...
+
+    async def _link_gallery_contents(
+        self,
+        gallery: Gallery,
+        item: HasMetadata,
+        entities: Sequence[Scene | Image],
+    ) -> None: ...
 
     async def _has_media_content(self, item: HasMetadata) -> bool: ...
 
@@ -301,7 +309,7 @@ class StashProcessingProtocol(Protocol):
         account: Account,
         performer: Performer,
         studio: Studio | None,
-    ) -> None: ...
+    ) -> Gallery | None: ...
 
     async def process_creator_incremental(self) -> None: ...
 
@@ -344,3 +352,21 @@ class StashProcessingProtocol(Protocol):
         split_pairs: list[tuple[Media, Scene]],
     ) -> None: ...
 
+    async def _flush_adjudicated_entities(
+        self,
+        split_pairs: list[tuple[Media, Scene]],
+    ) -> Exception | None: ...
+
+    async def _persist_media_stash_ids(
+        self,
+        media_with_id: list[Media],
+        split_pairs: list[tuple[Media, Scene]],
+    ) -> None: ...
+
+    async def _compose_and_flush_galleries(
+        self,
+        account: Account,
+        performer: Performer,
+        studio: Studio | None,
+        item_entities: dict[int, tuple[Post | Message, list[Scene | Image]]],
+    ) -> Exception | None: ...
