@@ -556,6 +556,9 @@ def _rebuild_schema_from_config(config: FanslyConfig) -> ConfigSchema:
             override_dldir_w_mapped=config.stash_override_dldir_w_mapped,
             require_stash_only_mode=config.stash_require_stash_only_mode,
             enable_scene_split=config.stash_enable_scene_split,
+            # Round-tripped like the rest: omitting a knob here silently resets
+            # the operator's YAML value to the schema default on every save.
+            scan_settle_s=config.stash_scan_settle_s,
         )
 
     # Re-use the existing schema if available so we don't lose monitoring/logic

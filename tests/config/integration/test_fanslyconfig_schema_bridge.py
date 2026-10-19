@@ -254,6 +254,36 @@ def test_stash_mapped_path_none_when_absent(
     assert fresh_config.stash_mapped_path is None
 
 
+def test_stash_scan_settle_s_survives_save(
+    config_dir: Path, fresh_config: FanslyConfig
+) -> None:
+    """A custom stash_context.scan_settle_s is not reset by a config save.
+
+    _rebuild_schema_from_config rebuilds the stash section on every save; it
+    used to omit scan_settle_s, so each save wrote the 3.5 s default back.
+    """
+    yaml_path = config_dir / "config.yaml"
+
+    schema = ConfigSchema()
+    schema.stash_context = StashContextSection(
+        scheme="http",
+        host="localhost",
+        port=9999,
+        apikey="",
+        scan_settle_s=7.5,
+    )
+    schema.dump_yaml(yaml_path)
+
+    load_config(fresh_config)
+    assert fresh_config.stash_scan_settle_s == 7.5
+    assert fresh_config._save_config() is True
+
+    second_config = FanslyConfig(program_version="0.13.0")
+    load_config(second_config)
+
+    assert second_config.stash_scan_settle_s == 7.5
+
+
 # ---------------------------------------------------------------------------
 # 7. Rate limiting fields round-trip
 # ---------------------------------------------------------------------------
