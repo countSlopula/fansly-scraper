@@ -181,10 +181,16 @@ class StashProcessingBase(StashProcessingProtocol):
         if not self.state.base_path:
             print_info("No download path set, attempting to create one...")
             try:
+                # `set_create_directory_for_download` sets `base_path` itself, to
+                # the CREATOR ROOT — deliberately not `download_path`, which with
+                # separate_timeline / separate_messages is a subfolder of it.
+                # base_path is the ownership root every path check compares
+                # against (`_image_files_all_local`, `_sweep_creator_files`), so
+                # narrowing it to one subfolder makes every file outside that
+                # subfolder look foreign and stops it being stamped.
                 self.state.download_path = set_create_directory_for_download(
                     self.config, self.state
                 )
-                self.state.base_path = self.state.download_path
                 print_info(f"Created download path: {self.state.download_path}")
             except Exception as e:
                 print_error(f"Failed to create download path: {e}")

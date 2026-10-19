@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 import pytest
 import respx
 
+from download.types import DownloadType
+from pathio import get_stash_path
 from tests.fixtures.stash.stash_api_fixtures import dump_graphql_calls
 
 
@@ -89,6 +91,52 @@ class TestRequestTimeout:
         monkeypatch.setattr(processor.context.client, "http_transport", None)
 
         processor._apply_request_timeout()  # must not raise
+
+
+class TestScanCreatorFolderBasePath:
+    """base_path is the creator ROOT when scan_creator_folder has to create it."""
+
+    @pytest.mark.asyncio
+    async def test_created_base_path_is_creator_root_not_subfolder(
+        self, respx_stash_processor, tmp_path, monkeypatch
+    ):
+        """A separated download type must not narrow the ownership root.
+
+        With ``separate_timeline`` the created ``download_path`` is
+        ``<creator>/Timeline``, but ``base_path`` is the root every ownership
+        check compares against (``_image_files_all_local``,
+        ``_sweep_creator_files``). Narrowing it to one subfolder makes every
+        file outside that subfolder look foreign — no stamping, and a bogus
+        "foreign co-resident" error per image.
+        """
+        processor = respx_stash_processor
+        processor.config.download_directory = tmp_path
+        processor.config.use_folder_suffix = True
+        processor.config.separate_timeline = True
+        processor.config.stash_scan_settle_s = 0
+        processor.state.creator_name = "creator"
+        processor.state.download_type = DownloadType.TIMELINE
+        processor.state.base_path = None
+
+        scanned: list[list[str]] = []
+
+        async def fake_scan(paths, flags):
+            scanned.append(paths)
+            return "job-1"
+
+        async def fake_wait(job_id):
+            return True
+
+        monkeypatch.setattr(processor.context.client, "metadata_scan", fake_scan)
+        monkeypatch.setattr(processor.context.client, "wait_for_job", fake_wait)
+
+        await processor.scan_creator_folder()
+
+        creator_root = tmp_path / "creator_fansly"
+        assert processor.state.download_path == creator_root / "Timeline"
+        assert processor.state.base_path == creator_root
+        # The whole creator folder is scanned, not just the Timeline subfolder.
+        assert scanned == [[get_stash_path(creator_root, processor.config)]]
 
 
 class TestPreloadEntities:
