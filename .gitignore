@@ -192,3 +192,6 @@ config.ini.bak.*
 .direnv/
 result
 result-*
+
+# Claude Code local settings
+.claude/settings.local.json
