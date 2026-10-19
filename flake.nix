@@ -28,8 +28,10 @@
 
       postgres = pkgs.postgresql_17;
 
-      # 5433 so this can never collide with a system postgres on 5432.
-      pgPort = "5433";
+      # 5432: the default the test fixtures resolve to (FANSLY_PG_PORT), so
+      # `pytest` needs no extra env. There is no system postgres on NixOS here
+      # to collide with; if one is ever enabled, override FANSLY_PG_PORT.
+      pgPort = "5432";
       pgName = "fansly"; # used for both the superuser role and the database
 
       # postgres has its own openssl/zlib in its RPATH; keep the wheel
@@ -97,6 +99,13 @@
           PGPORT = pgPort;
           PGUSER = pgName;
           PGDATABASE = pgName;
+
+          # The test fixtures resolve their own PG connection params and default
+          # the user to $USER, which is not a role in this cluster. Point them at
+          # the cluster's superuser so `pytest` needs no per-invocation env.
+          FANSLY_PG_HOST = "127.0.0.1";
+          FANSLY_PG_PORT = pgPort;
+          FANSLY_PG_USER = pgName;
         };
 
         shellHook = ''

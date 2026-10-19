@@ -185,3 +185,10 @@ config.ini.bak.*
 
 #ignore possible download folders
 *_fansly/
+
+# Nix dev shell (flake.nix): project-local PostgreSQL cluster + socket dir
+.pgdata/
+.pgsock/
+.direnv/
+result
+result-*
