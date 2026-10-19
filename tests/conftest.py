@@ -63,6 +63,8 @@ faulthandler.enable(file=sys.stderr, all_threads=True)
 # of them (config.*, anything that touches loguru) evaluate the
 # ``TESTING`` env at runtime via paths that can be triggered at
 # fixture-collection time.
+import unittest.mock  # noqa: E402
+
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 from loguru import logger  # noqa: E402
@@ -83,6 +85,50 @@ from tests.fixtures.download.download_factories import (  # noqa: E402
     DownloadStateFactory,
 )
 from tests.fixtures.utils.test_isolation import snowflake_id  # noqa: E402
+
+
+# ============================================================================
+# Stash WebSocket stub
+# ============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _stub_stash_websocket_session():
+    """Stop ``StashClient.initialize()`` from opening a real WebSocket.
+
+    SGC's ``initialize()`` connects BOTH an HTTP session and a WebSocket
+    subscription session. respx mocks HTTP only, so the WS ``connect_async``
+    falls through to a real socket and every respx-based Stash test dies at
+    fixture setup with ``RuntimeError: Failed to initialize Stash client:
+    Connect failed`` — even integration tests, whose Stash container serves
+    HTTP but is not reached over ws here.
+
+    Nothing in this project uses GraphQL subscriptions (the only ws consumers
+    in SGC are ``subscribe*`` / ``wait_for_job_with_updates``; our scan waits
+    via ``wait_for_job``, which polls over HTTP), so handing back a dummy
+    session is faithful.
+
+    Deliberately patches via ``mock.patch.object`` rather than requesting the
+    ``monkeypatch`` fixture: an autouse fixture in THIS file that depends on
+    ``monkeypatch`` would force it to be set up before every per-module fixture
+    and therefore torn down after them. That inverts undo order for any test
+    whose module fixture also clears the attribute monkeypatch has to restore
+    (e.g. ``_clear_handle_interrupt_flag`` in
+    tests/core/unit/test_fansly_downloader_ng.py), turning monkeypatch's undo
+    into an AttributeError at teardown.
+    """
+    from gql import Client
+    from gql.transport.websockets import WebsocketsTransport
+
+    real_connect_async = Client.connect_async
+
+    async def connect_async(self, *args, **kwargs):
+        if isinstance(self.transport, WebsocketsTransport):
+            return unittest.mock.AsyncMock(name="stub_ws_session")
+        return await real_connect_async(self, *args, **kwargs)
+
+    with unittest.mock.patch.object(Client, "connect_async", connect_async):
+        yield
 
 
 # ============================================================================
