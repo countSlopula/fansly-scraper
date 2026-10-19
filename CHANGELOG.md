@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **A custom `stash_context.scan_settle_s` survives a config save.** Writing `config.yaml` back rebuilt the `stash_context` section without `scan_settle_s`, so every save reset an operator's value to the 3.5 s default.
 - **With `separate_timeline` / `separate_messages`, Stash processing covers the whole creator folder again.** When the download path had to be created first, `base_path` — the ownership root every path check compares against — was narrowed to the `Timeline` or `Messages` subfolder, so the scan covered only that subfolder and every file outside it looked foreign and was never stamped.
 - **Creator folders resolve to their on-disk casing on case-insensitive storage.** On NFS/SMB mounts and macOS, `exists()` is true for `Example_fansly` when the folder is really `example_fansly`, so the requested casing was returned and the string-prefix comparison against Stash's paths silently failed. The real directory listing is now consulted; an exact-name entry wins, a case-insensitive match is the fallback.
+- **`--stash-only` no longer reports a media and its downloaded variant as a filename collision.** Same-file detection compared `download_id`, which is never persisted, so on a stash-only run a post's media and the variant actually downloaded — one file, two rows recording it — looked like an ambiguous collision and the second owner was dropped. Identical `local_filename` values now count as the same file.
 
 ## [0.15.1] - 2026-07-14
 

@@ -574,13 +574,20 @@ class StashProcessingBase(StashProcessingProtocol):
             return
         existing_media, owners = existing
         # Same file when it's the same Media object, OR distinct media that
-        # resolve to the same downloaded file (shared download target — the
-        # leaf is built from `download_id or id`, so a same-leaf clash with a
-        # matching target IS one physical file). Only a different target is a
-        # genuine ambiguous collision.
-        same_file = existing_media is media or (
-            existing_media.download_id or existing_media.id
-        ) == (media.download_id or media.id)
+        # resolve to the same downloaded file: identical `local_filename`, or a
+        # shared download target (the leaf is built from `download_id or id`, so
+        # a same-leaf clash with a matching target IS one physical file). Only a
+        # same leaf recorded under a DIFFERENT filename is a genuine ambiguous
+        # collision. `local_filename` carries this on its own because
+        # `download_id` is transient (never persisted): on a stash-only run every
+        # media loads with it None, and the id test alone then reports a parent
+        # and its variant — one file, two rows naming it — as a collision.
+        same_file = (
+            existing_media is media
+            or existing_media.local_filename == media.local_filename
+            or (existing_media.download_id or existing_media.id)
+            == (media.download_id or media.id)
+        )
         if not same_file:
             logger.warning(
                 f"Media-index leaf collision on {leaf!r}: media "

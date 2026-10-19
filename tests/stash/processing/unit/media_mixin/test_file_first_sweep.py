@@ -273,6 +273,66 @@ class TestBuildMediaIndex:
         assert str(second.id) in output
 
     @pytest.mark.asyncio
+    async def test_leaf_collision_same_local_filename_unions_owners(
+        self, entity_store, respx_stash_processor
+    ):
+        """Distinct media recording the SAME local_filename union owners.
+
+        The parent media and the variant actually downloaded both record the
+        file they share. ``download_id`` would identify them as one target, but
+        it is transient (never persisted), so on a stash-only run — where media
+        are loaded from the DB rather than built by the download path — it is
+        None on both and only the recorded filename is left to compare. The
+        index must union the owners and NOT warn: this is one physical file.
+        """
+        acct_id = snowflake_id()
+        account = AccountFactory.build(id=acct_id, username="test_user")
+        await entity_store.save(account)
+
+        variant_id = snowflake_id()  # the variant actually downloaded
+        leaf_name = f"2026-01-01_at_00-00_UTC_id_{variant_id}.mp4"
+
+        media_objs = []
+        posts = []
+        for media_id in (snowflake_id(), variant_id):
+            m = MediaFactory.build(
+                id=media_id,
+                accountId=acct_id,
+                mimetype="video/mp4",
+                is_downloaded=True,
+                download_id=None,  # transient field, absent on a stash-only run
+                local_filename=leaf_name,
+            )
+            await entity_store.save(m)
+            media_objs.append(m)
+            am = AccountMediaFactory.build(
+                id=snowflake_id(), accountId=acct_id, mediaId=m.id
+            )
+            await entity_store.save(am)
+            post = PostFactory.build(id=snowflake_id(), accountId=acct_id)
+            post.attachments = [
+                AttachmentFactory.build(
+                    postId=post.id,
+                    contentId=am.id,
+                    contentType=ContentType.ACCOUNT_MEDIA,
+                    pos=0,
+                )
+            ]
+            posts.append(post)
+
+        sink = io.StringIO()
+        sink_id = loguru_logger.add(sink, level="WARNING")
+        try:
+            index = await respx_stash_processor._build_media_index(posts)
+        finally:
+            loguru_logger.remove(sink_id)
+
+        _got_media, owners = index[leaf_name]
+        # Both owning posts present (no dropped gallery joins), and no warning.
+        assert sorted(o.id for o in owners) == sorted(p.id for p in posts)
+        assert "leaf collision" not in sink.getvalue()
+
+    @pytest.mark.asyncio
     async def test_leaf_collision_same_download_target_unions_owners(
         self, entity_store, respx_stash_processor
     ):
