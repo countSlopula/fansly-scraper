@@ -228,6 +228,7 @@ class FanslyConfig:
     stash_require_stash_only_mode: bool = False
     stash_enable_scene_split: bool | Literal["dry-run"] = False
     stash_scan_settle_s: float = 3.5
+    stash_request_timeout_s: int = 300
 
     # Logging
     # ``log_levels`` is the legacy flat ``{logger_name: level_string}``
@@ -559,6 +560,7 @@ def _rebuild_schema_from_config(config: FanslyConfig) -> ConfigSchema:
             # Round-tripped like the rest: omitting a knob here silently resets
             # the operator's YAML value to the schema default on every save.
             scan_settle_s=config.stash_scan_settle_s,
+            request_timeout_s=config.stash_request_timeout_s,
         )
 
     # Re-use the existing schema if available so we don't lose monitoring/logic

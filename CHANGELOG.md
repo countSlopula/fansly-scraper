@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable Stash request timeout (`stash_context.request_timeout_s`, default 300 s).** A creator's Scene/Image/Gallery writes flush in batches of up to 250 mutations per GraphQL request, which on a large creator (or a Stash across the network) runs well past the client library's hardcoded 30 s — the run then dies with `Request to http://…/graphql timed out` after every file has already been downloaded. The library's own `Timeout` connection key never reaches it (`StashContext` drops every key except Scheme/Host/Port/ApiKey/Logger), so the configured value is applied to the connected client's gql `execute_timeout` and httpx transport instead.
+
 ### Fixed
 
 - **Post and message attachments are persisted, so `--stash-only` stops silently doing nothing.** `EntityStore.save()` cascaded only association-table relationships, so reverse-FK children that exist purely as nested API payload — `Post.attachments`, `Message.attachments`, `Post.mentions` — lived in the identity map for the run and were never written. A later `--stash-only` run therefore preloaded every post attachment-less, built an empty media index, and finished in seconds having created no galleries and updated no titles, looking exactly like a clean run. `has_many(cascade_save=True)` relationships now reconcile their rows on the parent's save, matched by a new `__natural_key__` (re-processing the same timeline is a no-op instead of a duplicate insert, an attachment the API dropped is deleted, and a cold-loaded parent with no children hydrated never deletes anything). Existing creators need one normal download run to backfill the rows.

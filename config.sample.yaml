@@ -114,3 +114,8 @@ logic:
 #   # /data/fansly and leave download_directory as /home/user/downloads.
 #   # Leave as null (or omit) when both environments share the same paths.
 #   mapped_path: null
+#   # Seconds allowed for one GraphQL request. A creator's entity flush batches
+#   # up to 250 mutations into a single request, so a large creator (or a Stash
+#   # on the other side of a network) needs far more than the client library's
+#   # 30 s default; raise this if a run fails with "Request to ... timed out".
+#   request_timeout_s: 300

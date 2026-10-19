@@ -58,6 +58,39 @@ class TestStashProcessingBase:
         assert title == username
 
 
+class TestRequestTimeout:
+    """Test _apply_request_timeout."""
+
+    def test_timeout_applied_to_live_client(self, respx_stash_processor):
+        """The configured timeout reaches the already-connected client.
+
+        SGC hardcodes 30 s and its ``Timeout`` conn key is stripped by
+        ``StashContext._normalize_conn_keys``, so a whole-creator flush (up to
+        250 mutations in one request) died on a large creator. Both the gql
+        execute timeout and the httpx transport must pick the new value up.
+        """
+        processor = respx_stash_processor
+        processor.config.stash_request_timeout_s = 600
+
+        processor._apply_request_timeout()
+
+        client = processor.context.client
+        assert client.gql_client.execute_timeout == 600
+        assert client.http_transport.kwargs["timeout"] == 600
+        assert client.http_transport.client.timeout.read == 600
+
+    def test_missing_client_internals_warn_instead_of_raising(
+        self, respx_stash_processor, monkeypatch
+    ):
+        """A library that renames these attributes must not break processing."""
+        processor = respx_stash_processor
+        monkeypatch.setattr(processor.context.client, "gql_client", None)
+        monkeypatch.setattr(processor.context.client, "gql_ws_client", None)
+        monkeypatch.setattr(processor.context.client, "http_transport", None)
+
+        processor._apply_request_timeout()  # must not raise
+
+
 class TestPreloadEntities:
     """Test _preload_stash_entities."""
 

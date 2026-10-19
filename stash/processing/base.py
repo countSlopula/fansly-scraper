@@ -241,6 +241,53 @@ class StashProcessingBase(StashProcessingProtocol):
         if self.config.stash_enable_scene_split is True:
             Scene.__create_input_type__ = SceneCreateInput
 
+    def _apply_request_timeout(self) -> None:
+        """Raise the connected client's per-request timeout to the configured one.
+
+        SGC defaults to 30 s per GraphQL request and only reads its own
+        ``Timeout`` knob out of the connection dict — which never reaches it,
+        because ``StashContext._normalize_conn_keys`` keeps Scheme/Host/Port/
+        ApiKey/Logger and drops everything else. Meanwhile a whole-creator
+        flush batches up to 250 mutations into ONE request: on a creator with a
+        thousand media that runs past 30 s and the run dies with "Request to
+        ... timed out" AFTER every file has already been downloaded.
+
+        So the timeout is set on the live objects instead: gql reads
+        ``execute_timeout`` off the Client at each ``execute()``, and httpx's
+        ``AsyncClient.timeout`` is a settable property, so both take effect on
+        the already-connected session. Best-effort — a library version that
+        renames these attributes must not stop the run from processing.
+        """
+        timeout = self.config.stash_request_timeout_s
+        client = self.context.client
+        applied = False
+        for gql_client in (
+            getattr(client, "gql_client", None),
+            getattr(client, "gql_ws_client", None),
+        ):
+            if gql_client is not None and hasattr(gql_client, "execute_timeout"):
+                gql_client.execute_timeout = timeout
+                applied = True
+        transport = getattr(client, "http_transport", None)
+        # kwargs feed httpx.AsyncClient on (re)connect; .client is the live one.
+        transport_kwargs = getattr(transport, "kwargs", None)
+        if isinstance(transport_kwargs, dict):
+            transport_kwargs["timeout"] = timeout
+            applied = True
+        http_client = getattr(transport, "client", None)
+        if http_client is not None:
+            with contextlib.suppress(Exception):
+                http_client.timeout = timeout
+                applied = True
+        if applied:
+            logger.debug(f"Stash request timeout set to {timeout}s")
+        else:
+            print_warning(
+                f"Could not apply the configured Stash request timeout "
+                f"({timeout}s); the client's own default applies. Large "
+                f"creators may fail to flush."
+            )
+
     async def _connect_stash(self) -> bool:
         """Connect the Stash client and prepare guards + preload.
 
@@ -272,6 +319,7 @@ class StashProcessingBase(StashProcessingProtocol):
             print_error(f"Failed to initialize Stash client: {e}")
             return False
         logger.debug("Client initialized, proceeding with scan")
+        self._apply_request_timeout()
 
         # Surface v0.11 deprecation/unmapped field warnings in logs
         warnings.filterwarnings(

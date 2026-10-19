@@ -734,6 +734,11 @@ class StashContextSection(_BaseSection):
     # Stash's index commit can lag the job-FINISHED signal by a few hundred
     # ms; reading File/Scene/Image back without a settle window races.
     scan_settle_s: float = Field(default=3.5, ge=0.0, le=30.0)
+    # Seconds to wait on one GraphQL request. A whole-creator flush batches up
+    # to 250 mutations into a SINGLE request, which on a large creator (or a
+    # Stash on the other end of a network) runs well past the library's own
+    # 30 s default and kills the run after the media are already downloaded.
+    request_timeout_s: int = Field(default=300, ge=1, le=3600)
 
     @field_validator("enable_scene_split", mode="before")
     @classmethod
